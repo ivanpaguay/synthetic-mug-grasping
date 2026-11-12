@@ -1,0 +1,60 @@
+// =========================================================================
+// part_label  v1.1   (Attribute Wrangle, Run Over: Primitives)
+// Houdini node: /obj/geo5/part_label      in0 = boolean1
+// Labels the mug parts AFTER the boolean (physics mesh, no noise).
+// in0 = joined mug (body + handle). The handle primitives must arrive with
+//       s@affordance_part = "handle" (from ASA_AFFORDANCE / handle_label,
+//       before the boolean; the Boolean keeps each input's primitive attributes).
+// Writes s@affordance_part and a copy in s@part (the name read by
+// wrist_align, robotiq_close and grasp_contacts).
+// Canonical frame: mug axis at x = z = 0, base at minimum y.
+//
+// Rules (in this order):
+//   handle    : already labelled by the handle branch
+//   rim       : within rim_band of the mouth (outside, lip and inside)
+//   interior  : the normal points towards the axis (inner wall) or upwards
+//               (inner bottom; the lip is already rim)
+//   base      : within base_band of the outer bottom
+//   body      : the rest (outer wall)
+// Parameters (0 = default):
+//   rim_band (m, 0.010)  base_band (m, 0.010)  interior_dot (0.3)
+//   show_colors (toggle): for review only; off in production
+// v1.1: reads affordance_part; the inner bottom no longer falls into "base".
+// =========================================================================
+
+float rim_band  = chf("rim_band");     if (rim_band  <= 0) rim_band  = 0.010;
+float base_band = chf("base_band");    if (base_band <= 0) base_band = 0.010;
+float idot      = chf("interior_dot"); if (idot      <= 0) idot      = 0.3;
+
+vector mn, mx;
+getbbox(0, mn, mx);
+
+string part = s@affordance_part;
+if (part != "handle") {
+    vector c = primuv(0, "P", @primnum, {0.5, 0.5});
+    vector N = normalize(prim_normal(0, @primnum, {0.5, 0.5}));
+    vector radial = set(c.x, 0.0, c.z);
+    float rr = length(radial);
+    radial = (rr > 1e-6) ? radial / rr : set(1, 0, 0);
+
+    if (c.y > mx.y - rim_band) {
+        part = "rim";
+    } else if (dot(N, radial) < -idot || N.y > 0.7) {
+        part = "interior";            // inner wall or inner bottom
+    } else if (c.y < mn.y + base_band) {
+        part = "base";
+    } else {
+        part = "body";
+    }
+}
+s@affordance_part = part;
+s@part = part;
+
+if (chi("show_colors")) {
+    vector col = {0.6, 0.6, 0.6};
+    if (part == "handle")   col = {0.9, 0.1, 0.1};
+    if (part == "rim")      col = {0.1, 0.8, 0.1};
+    if (part == "interior") col = {0.9, 0.8, 0.1};
+    if (part == "base")     col = {0.1, 0.3, 0.9};
+    v@Cd = col;
+}

@@ -1,0 +1,91 @@
+// =========================================================================
+// link_collision_prep  v1.5   (Attribute Wrangle, Run Over: Points)
+// Houdini nodes: /obj/geo5/collition_prep_points (collision cloud),
+//                /obj/geo5/collition_prep_mesh (visible mesh)
+//
+// Prepares each finger link's collision point cloud for robotiq_close, and
+// the visible gripper mesh for mesh_rigid_deform.
+// in0 = points on the finger meshes, in zero pose, with the link name in
+//       s@urdf_link, s@name or s@path (Blender/OBJ), on the point or on its
+//       primitive. Suffixes are accepted: "finger_1_link_1_visual",
+//       "finger_1_link_1.001"...
+// in1 = rest skeleton (urdf_skeleton, open_pose = 0), BEFORE wrist_align.
+// Parameters: delete_bad (toggle). 0 = keep rejected points and record why
+//             (for debugging). 1 = delete them.
+//             include_fixed (toggle). 1 = also keep the fixed parts (palm ->
+//             wrist, _00 bases) with their lp. Use it for the VISIBLE mesh;
+//             leave it at 0 for the collision cloud.
+//
+// Output: v@lp (local position in its joint frame), s@joint_name,
+//         i@prep_ok, s@prep_reason.
+// =========================================================================
+
+int del_bad = chi("delete_bad");
+i@prep_ok = 0;
+
+string key = "";
+// look for the name in urdf_link, name or path (Blender/OBJ use path),
+// first on the point, then on its primitive
+string cands[] = array("urdf_link", "name", "path");
+foreach (string an; cands) {
+    if (key == "" && haspointattrib(0, an)) key = point(0, an, @ptnum);
+}
+if (key == "") {
+    int vtx = pointvertex(0, @ptnum);
+    if (vtx >= 0) {
+        int pr = vertexprim(0, vtx);
+        foreach (string an; cands) {
+            if (key == "" && hasprimattrib(0, an)) key = prim(0, an, pr);
+        }
+    }
+}
+
+// if the name is a path (".../finger_1_link_1/finger_1_link_2_visual"),
+// use only its last element
+if (key != "") {
+    string parts[] = split(key, "/");
+    if (len(parts) > 0) key = parts[-1];
+}
+s@prep_key = key;
+if (key == "") {
+    s@prep_reason = "no urdf_link, name or path on the point or its primitive";
+    if (del_bad) removepoint(0, @ptnum);
+    return;
+}
+if (!haspointattrib(1, "urdf_link")) {
+    s@prep_reason = "the skeleton on input 1 has no urdf_link (use urdf_skeleton v1.2)";
+    if (del_bad) removepoint(0, @ptnum);
+    return;
+}
+
+// joint whose urdf_link is the start of the name (tolerates suffixes)
+int j = -1;
+int best_len = 0;
+for (int i = 0; i < npoints(1); i++) {
+    string ul = point(1, "urdf_link", i);
+    if (ul != "" && startswith(key, ul) && len(ul) > best_len) {
+        j = i;
+        best_len = len(ul);
+    }
+}
+if (j < 0) {
+    s@prep_reason = "no skeleton link matches '" + key + "'";
+    if (del_bad) removepoint(0, @ptnum);
+    return;
+}
+
+string jn = point(1, "name", j);
+string tail = jn[-3:];
+int incl_fixed = chi("include_fixed");
+if (!incl_fixed && tail != "_01" && tail != "_02" && tail != "_03") {
+    s@prep_reason = "fixed part (" + jn + "): not part of the closing motion";
+    if (del_bad) removepoint(0, @ptnum);
+    return;
+}
+
+vector pj = point(1, "P", j);
+matrix3 X = point(1, "transform", j);
+v@lp = (@P - pj) * transpose(X);      // the rows of X are the link axes
+s@joint_name = jn;
+i@prep_ok = 1;
+s@prep_reason = "ok";

@@ -1,0 +1,23 @@
+// =========================================================================
+// place_gripper  v1   (Attribute Wrangle, Run Over: Points)
+// Houdini node: /obj/geo5/place_hand      in0 = mesh_rigid_deform, in1 = scene_layout
+// Moves the gripper mesh (posed in the MUG frame) into the scene: same
+// rotation and position as the target mug.
+//
+// in0 = visible mesh of the posed gripper (output of mesh_rigid_deform v1.1
+//       with the skeleton of the chosen grasp)
+// in1 = scene_layout (reads target_orient and target_pos from the detail)
+// Next: Normal SOP. For the masks, the block below marks the gripper as
+// instance 100.
+// =========================================================================
+vector4 q = detail(1, "target_orient");
+vector  T = detail(1, "target_pos");
+@P = qrotate(q, @P) + T;
+if (@ptnum == 0) {
+    // primitive attributes for the whole gripper (once)
+    for (int pr = 0; pr < nprimitives(0); pr++) {
+        setprimattrib(0, "instance_id", pr, 100);
+        setprimattrib(0, "class",       pr, "gripper");
+        setprimattrib(0, "name",        pr, "gripper");
+    }
+}

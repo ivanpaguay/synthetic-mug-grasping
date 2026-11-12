@@ -1,0 +1,72 @@
+// =========================================================================
+// mug_metrics  v1.1   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/mug_metrics      in0 = attribwrangle9 (normalize_base)
+// in0 = PHYSICS mesh of the mug (closed, after part_label, no noise)
+// Computes material volume, mass, centre of mass, area and measurements and
+// stores them as detail attributes (the mug_json node writes them to JSON).
+// The volume uses the divergence theorem: it is only correct if the mesh is
+// CLOSED with outward normals (negative volume = flipped normals).
+// v1.1: Houdini orders vertices CLOCKWISE seen from the face (outward
+//       normal), the reverse of the counter-clockwise convention of the
+//       volume formula, so the sign is flipped.
+// Parameters: density (kg/m3, default 2400 = porcelain / ceramic)
+// Generator parameters (create the sliders with the parameter button and give
+// each one the same expression as the handle node, e.g. @glass_h, or a
+// reference: ch("../ASA/glass_h")):
+//   mug_id (integer: @wedgeindex), glass_h, glass_r_base, glass_r_top,
+//   glass_bulge, glass_flare, handle_v_top, handle_v_bottom, handle_width,
+//   handle_box, handle_angle, wall_thickness, noise_glass
+// =========================================================================
+
+// ---------- generator parameters -> detail (for the JSON) ----------
+i@mug_id          = chi("mug_id");
+f@glass_h         = chf("glass_h");
+f@glass_r_base    = chf("glass_r_base");
+f@glass_r_top     = chf("glass_r_top");
+f@glass_bulge     = chf("glass_bulge");
+f@glass_flare     = chf("glass_flare");
+f@handle_v_top    = chf("handle_v_top");
+f@handle_v_bottom = chf("handle_v_bottom");
+f@handle_width    = chf("handle_width");
+f@handle_box      = chf("handle_box");
+f@handle_angle    = chf("handle_angle");
+f@wall_thickness  = chf("wall_thickness");
+f@noise_glass     = chf("noise_glass");      // affects the render mesh only
+
+float density = chf("density");
+if (density <= 0) density = 2400.0;
+
+float V = 0.0;          // signed volume
+float A = 0.0;          // area
+vector M1 = 0;          // first moment (for the centre of mass)
+int np = nprimitives(0);
+for (int pr = 0; pr < np; pr++) {
+    int pts[] = primpoints(0, pr);
+    int n = len(pts);
+    if (n < 3) continue;
+    vector p0 = point(0, "P", pts[0]);
+    for (int i = 1; i < n - 1; i++) {                       // triangle fan
+        vector p1 = point(0, "P", pts[i]);
+        vector p2 = point(0, "P", pts[i + 1]);
+        float v = -dot(p0, cross(p1, p2)) / 6.0;            // tetrahedron with the origin (sign: Houdini's clockwise order)
+        V  += v;
+        M1 += v * (p0 + p1 + p2) / 4.0;
+        A  += 0.5 * length(cross(p1 - p0, p2 - p0));
+    }
+}
+
+vector mn, mx;
+getbbox(0, mn, mx);
+
+f@mug_volume_m3   = V;
+f@mug_mass_kg     = V * density;
+f@mug_density     = density;
+v@mug_com         = (abs(V) > 1e-12) ? M1 / V : 0;
+f@mug_area_m2     = A;
+v@mug_bbox_min    = mn;
+v@mug_bbox_max    = mx;
+f@mug_height      = mx.y - mn.y;
+i@mug_closed_ok   = (V > 0) ? 1 : 0;      // 0 -> open mesh or flipped normals
+
+if (V <= 0)
+    warning("mug_metrics: volume <= 0 (%g m3): open mesh or flipped normals", V);

@@ -1,0 +1,680 @@
+// =========================================================================
+// wrist_align  v5.13   (Detail wrangle)
+// Houdini node: /obj/geo5/wrist_nuevo1
+// Places the gripper for one grasp candidate around the mug.
+// in0 = KineFX skeleton at rest (generated from the URDF)
+// in1 = unpacked mug with zones (s@part, or red Cd = handle)
+// in2 = mug SDF (the same VDB robotiq_close uses)
+// in3 = finger-link collision cloud (link_collision_prep, the same one
+//       robotiq_close uses). Without in3 -> capsules.
+//
+// Body mode   = place the hand around the mug body + open-hand filter: if the
+//               open hand penetrates more than 1 mm, try nearby roll/height
+//               values; if none is clear, keep the original (gen_status).
+// Handle mode = frontal pinch on the handle with automatic roll. Used only
+//               when the approach tilt is <= handle_max_tilt (default 30 deg):
+//               the handle pinch assumes an almost horizontal approach; with
+//               more tilt the handle is treated as an obstacle (body mode).
+// Hand frame: approach = wrist -> connect (palm normal); the thumb -> pair axis
+// is kept horizontal (thumb_side = +1/-1), the same at every azimuth.
+// The URDF attributes (joint_axis, scissor_axis, scissor_pivot) are rotated
+// with the hand so robotiq_close receives them in world space, and the open
+// hand is built from the real skeleton geometry (URDF open pose + scissor),
+// with the same rotation and the same collision test as robotiq_close's
+// start check, so both give the same verdict.
+// =========================================================================
+
+// ---------- utilities ----------
+int rh_sign()
+{
+    matrix3 m = ident();
+    rotate(m, 0.5, {0, 0, 1});
+    vector v = {1, 0, 0} * m;
+    return (v.y > 0) ? 1 : -1;
+}
+
+matrix3 rotm(vector axis; float ang; int rh)
+{
+    matrix3 m = ident();
+    rotate(m, ang * rh, normalize(axis));
+    return m;
+}
+
+int find_pt(string pat)
+{
+    int n = npoints(0);
+    for (int i = 0; i < n; i++) {
+        string nm = point(0, "name", i);
+        if (match(pat, nm)) return i;
+    }
+    return -1;
+}
+
+vector cd_at_point(int pt)
+{
+    vector c = {1, 1, 1};
+    if (haspointattrib(1, "Cd")) {
+        c = point(1, "Cd", pt);
+        return c;
+    }
+    int vtx = pointvertex(1, pt);
+    if (vtx >= 0) {
+        if (hasvertexattrib(1, "Cd")) {
+            c = vertex(1, "Cd", vtx);
+            return c;
+        }
+        if (hasprimattrib(1, "Cd")) {
+            c = prim(1, "Cd", vertexprim(1, vtx));
+            return c;
+        }
+    }
+    return c;
+}
+
+int is_handle(int pt)
+{
+    string p = "";
+    if (haspointattrib(1, "part")) p = point(1, "part", pt);
+    if (p == "" && hasprimattrib(1, "part")) {
+        int vtx = pointvertex(1, pt);
+        if (vtx >= 0) p = prim(1, "part", vertexprim(1, vtx));
+    }
+    if (p != "") return (p == "handle");
+    vector c = cd_at_point(pt);
+    return (c.x > 0.6 && c.y < 0.35 && c.z < 0.35);
+}
+
+// ---------- parameters ----------
+int   target_mode    = chi("target_mode");
+float palm_off       = chf("palm_to_glass_offset");
+float h_ratio        = chf("grasp_height_ratio");
+float tilt_deg       = chf("approach_tilt_deg");
+float rot_deg        = chf("approach_rot_deg");
+float roll_deg       = chf("roll_deg");
+int   roll_axis      = chi("roll_axis");
+float footprint      = chf("palm_footprint");
+float tip_over       = chf("tip_overshoot");
+float splay          = radians(chf("open_splay_deg"));
+float corr_margin    = chf("corridor_margin");
+int   pregrasp       = chi("pregrasp");
+float pre_dist       = chf("pre_dist");
+float pre_lift       = chf("pre_lift");
+int   manual_roll    = chi("handle_manual_roll");
+float r_link         = chf("pinch_link_radius");
+float handle_max_ang = chf("handle_max_angle");
+float handle_max_tilt = chf("handle_max_tilt");   // handle mode only up to this tilt
+float psplay         = radians(chf("pinch_splay_deg"));
+int   repair_off     = chi("repair_off");        // 1 = disable the open-hand filter
+float open_tol       = chf("open_pen_tol");      // tolerated open-hand penetration
+
+if (palm_off <= 0.0 || palm_off >= 0.5) palm_off = 0.1;
+if (h_ratio <= 0.0) h_ratio = 0.55;
+h_ratio = clamp(h_ratio, 0.05, 0.95);
+if (footprint <= 0.0) footprint = 0.05;
+if (pre_dist <= 0.0) pre_dist = 0.08;
+tilt_deg = clamp(tilt_deg, 0.0, 90.0);
+if (splay <= 0.0) splay = radians(15.0);
+if (corr_margin <= 0.0) corr_margin = 0.01;
+if (r_link <= 0.0) r_link = 0.008;
+if (handle_max_ang <= 0.0) handle_max_ang = 40.0;
+if (handle_max_tilt <= 0.0) handle_max_tilt = 30.0;
+if (open_tol <= 0.0) open_tol = 0.001;
+
+// ---------- skeleton ----------
+int p_conn = find_pt("*connect*");
+if (p_conn < 0) {
+    error("wrist_align: point 'connect' not found");
+    return;
+}
+vector c0 = point(0, "P", p_conn);
+
+string fname[] = array("thumb", "ring", "index");
+vector root[];
+vector mid[];
+vector tip[];
+vector fwd = 0;
+for (int f = 0; f < 3; f++) {
+    int a = find_pt("*" + fname[f] + "*01");
+    int b = find_pt("*" + fname[f] + "*02");
+    int m = find_pt("*" + fname[f] + "*03");
+    int t = find_pt("*" + fname[f] + "*04");
+    if (a < 0 || b < 0 || m < 0 || t < 0) {
+        error("wrist_align: missing chain %s", fname[f]);
+        return;
+    }
+    vector pa = point(0, "P", a);
+    vector pb = point(0, "P", b);
+    vector pm = point(0, "P", m);
+    vector ptip = point(0, "P", t);
+    root[f] = pa;
+    mid[f]  = pm;
+    tip[f]  = ptip;
+    fwd += normalize(pb - pa);
+}
+fwd = normalize(fwd);
+int urdf_rig = haspointattrib(0, "joint_axis");     // skeleton generated from the URDF
+int p_wrist = find_pt("wrist");
+if (urdf_rig && p_wrist >= 0) {
+    vector pw = point(0, "P", p_wrist);
+    if (length(c0 - pw) > 1e-6) fwd = normalize(c0 - pw);   // palm normal
+}
+
+float reach = 0;
+float reach_straight = 0;
+float root_w = 0;
+for (int f = 0; f < 3; f++) {
+    float r_al = dot(root[f] - c0, fwd);
+    float L    = dot(tip[f] - root[f], fwd);
+    vector lat = (root[f] - c0) - fwd * r_al;
+    reach          = max(reach, r_al + L * cos(splay));
+    reach_straight = max(reach_straight, L);
+    root_w         = max(root_w, length(lat));
+}
+float hand_halfwidth = root_w + reach_straight * sin(splay) + corr_margin;
+
+vector palm_x_rest = normalize(root[0] - 0.5 * (root[1] + root[2]));
+
+// ---------- open hand at rest (same kinematics as robotiq_close) ----------
+string cn = chs("close_node");
+float lr  = 0.0;
+float rp  = 0.0;
+float rm  = 0.0;
+float rd  = 0.0;
+float spd = 0.0;
+float scd = 0.0;
+if (cn != "") {
+    lr  = chf(cn + "/link_radius");
+    rp  = chf(cn + "/link_radius_prox");
+    rm  = chf(cn + "/link_radius_med");
+    rd  = chf(cn + "/link_radius_dist");
+    spd = chf(cn + "/open_splay_deg");
+    scd = chf(cn + "/scissor_deg");
+}
+if (lr  <= 0.0) lr  = 0.008;
+if (rp  <= 0.0) rp  = lr;
+if (rm  <= 0.0) rm  = lr;
+if (rd  <= 0.0) rd  = lr;
+if (spd <= 0.0) spd = 15.0;
+float orad[] = array(rp, rm, rd);
+float osplay = radians(spd);
+float osc = clamp(radians(scd), -0.178, 0.178);
+
+string chains[] = array("chain_thumb", "chain_ring", "chain_index");
+float  oscs[]   = array(0.0, osc, -osc);
+int use_mesh_w = (npoints(3) > 0 && haspointattrib(3, "lp"));
+int has_ok3 = haspointattrib(3, "prep_ok");
+vector CP[];          // link cloud, open hand, rest space
+vector OA[];
+vector OB[];
+float  OR[];
+int no = 0;
+for (int ci = 0; ci < 3; ci++) {
+    vector p[];
+    int ids[];
+    int np = 0;
+    for (int i = 0; i < npoints(0); i++) {
+        string c = point(0, "chain", i);
+        if (c == chains[ci]) {
+            vector pos = point(0, "P", i);
+            p[np] = pos;
+            ids[np] = i;
+            np++;
+        }
+    }
+    if (np != 4) continue;
+    if (urdf_rig) {
+        // ---- URDF rig: real open pose (joint_1 = lo, joint_2 = lo, joint_3 = hi) ----
+        vector ax[];
+        float dq[];
+        for (int k = 0; k < 3; k++) {
+            vector axk = point(0, "joint_axis", ids[k]);
+            ax[k] = normalize(axk);
+            float qr = point(0, "joint_q", ids[k]);
+            float qlo = point(0, "joint_lo", ids[k]);
+            float qhi = point(0, "joint_hi", ids[k]);
+            float qo = (k == 2) ? qhi : qlo;
+            dq[k] = qo - qr;
+        }
+        int RHs = rh_sign();
+        matrix3 Mj[];
+        for (int j = 0; j < 4; j++) Mj[j] = ident();
+        for (int k = 0; k < 3; k++) {
+            matrix3 mk = rotm(ax[k], dq[k], RHs);
+            for (int j = k + 1; j < 4; j++) p[j] = p[k] + (p[j] - p[k]) * mk;
+            for (int j = k + 1; j < 3; j++) ax[j] = ax[j] * mk;
+            for (int j = k; j < 4; j++) Mj[j] = Mj[j] * mk;
+        }
+        matrix3 msc = ident();
+        // scissor: the whole chain turns about the base axis (link_0)
+        string sct = point(0, "scissor_type", ids[0]);
+        string bjn = point(0, "urdf_base_joint", ids[0]);
+        if (sct == "revolute") {
+            float sgn = (bjn == "palm_finger_2_joint") ? -1.0 : 1.0;
+            float slo = point(0, "scissor_lo", ids[0]);
+            float shi = point(0, "scissor_hi", ids[0]);
+            float sr  = point(0, "scissor_q", ids[0]);
+            float st  = clamp(sgn * radians(scd), slo, shi);
+            vector spv = point(0, "scissor_pivot", ids[0]);
+            vector sax = point(0, "scissor_axis", ids[0]);
+            sax = normalize(sax);
+            msc = rotm(sax, st - sr, RHs);
+            for (int j = 0; j < 4; j++) p[j] = spv + (p[j] - spv) * msc;
+        }
+        for (int k = 0; k < 3; k++) {
+            OA[no] = p[k];
+            OB[no] = p[k + 1];
+            OR[no] = orad[k];
+            no++;
+        }
+        if (use_mesh_w) {
+            for (int k = 0; k < 3; k++) {
+                string nk = point(0, "name", ids[k]);
+                matrix3 Xr = point(0, "transform", ids[k]);
+                matrix3 Xo = Xr * Mj[k] * msc;            // link frame in the open hand
+                for (int i = 0; i < npoints(3); i++) {
+                    int okp = 1;
+                    if (has_ok3) okp = point(3, "prep_ok", i);
+                    if (!okp) continue;
+                    string jn = point(3, "joint_name", i);
+                    if (jn != nk) continue;
+                    vector l = point(3, "lp", i);
+                    append(CP, l * Xo + p[k]);
+                }
+            }
+        }
+        continue;
+    }
+    float Ls[];
+    for (int i = 0; i < 3; i++) Ls[i] = distance(p[i], p[i + 1]);
+    vector a0 = normalize(p[1] - p[0]);
+    vector toward = (ci == 0) ? -palm_x_rest : palm_x_rest;
+    vector r0 = toward - a0 * dot(toward, a0);
+    if (length(r0) < 1e-6) r0 = cross(a0, set(0, 1, 0));
+    r0 = normalize(r0);
+    matrix3 Rs = ident();
+    rotate(Rs, oscs[ci], a0);
+    vector r0s = r0 * Rs;
+    float ph = -osplay;
+    vector q = p[0];
+    for (int k = 0; k < 3; k++) {
+        vector qn = q + (a0 * cos(ph) + r0s * sin(ph)) * Ls[k];
+        OA[no] = q;
+        OB[no] = qn;
+        OR[no] = orad[k];
+        no++;
+        q = qn;
+    }
+}
+
+if (urdf_rig && no > 0) {
+    // reach and width of the hand, measured on the real open hand
+    reach = 0;
+    float wlat = 0;
+    for (int sg = 0; sg < no; sg++) {
+        vector ends[] = array(OA[sg], OB[sg]);
+        foreach (vector e; ends) {
+            vector rr = e - c0;
+            float al = dot(rr, fwd);
+            reach = max(reach, al);
+            wlat = max(wlat, length(rr - fwd * al) + OR[sg]);
+        }
+    }
+    hand_halfwidth = wlat + corr_margin;
+}
+
+// ---------- mug ----------
+int nmug = npoints(1);
+if (nmug < 10) {
+    warning("The mug has very few points: is it packed? Add an Unpack before input 1.");
+}
+if (nmug == 0) return;
+int use_sdf = (nprimitives(2) > 0);
+
+int hflag[];
+vector bmin  = set( 1e9,  1e9,  1e9);
+vector bmax  = set(-1e9, -1e9, -1e9);
+vector bbmin = bmin;
+vector bbmax = bmax;
+int n_handle = 0;
+for (int i = 0; i < nmug; i++) {
+    vector p = point(1, "P", i);
+    hflag[i] = is_handle(i);
+    bmin = min(bmin, p);
+    bmax = max(bmax, p);
+    if (hflag[i]) {
+        n_handle++;
+    } else {
+        bbmin = min(bbmin, p);
+        bbmax = max(bbmax, p);
+    }
+}
+if (n_handle == nmug) {
+    bbmin = bmin;
+    bbmax = bmax;
+}
+float H = bmax.y - bmin.y;
+vector axis_c = 0.5 * (bbmin + bbmax);
+float target_y = bmin.y + h_ratio * H;
+vector T_body = set(axis_c.x, target_y, axis_c.z);
+
+// ---------- handle ----------
+vector T_handle = T_body;
+vector radial_h = 0;
+vector nh = 0;
+float handle_az = -999;
+float bar_w = 0;
+if (n_handle > 0) {
+    float rmax_h = 0;
+    for (int i = 0; i < nmug; i++) {
+        if (!hflag[i]) continue;
+        vector d = point(1, "P", i) - axis_c;
+        d.y = 0;
+        rmax_h = max(rmax_h, length(d));
+    }
+    vector acc = 0;
+    int cnt = 0;
+    for (int i = 0; i < nmug; i++) {
+        if (!hflag[i]) continue;
+        vector p = point(1, "P", i);
+        vector d = p - axis_c;
+        d.y = 0;
+        if (length(d) >= 0.85 * rmax_h) {
+            acc += p;
+            cnt++;
+        }
+    }
+    T_handle = acc / max(cnt, 1);
+    radial_h = T_handle - axis_c;
+    radial_h.y = 0;
+    radial_h = normalize(radial_h);
+    handle_az = degrees(atan2(radial_h.z, radial_h.x));
+    nh = normalize(cross({0, 1, 0}, radial_h));
+
+    float wmin = 1e9;
+    float wmax = -1e9;
+    for (int i = 0; i < nmug; i++) {
+        if (!hflag[i]) continue;
+        vector p = point(1, "P", i);
+        vector d = p - axis_c;
+        d.y = 0;
+        if (length(d) >= 0.85 * rmax_h) {
+            float qd = dot(p - T_handle, nh);
+            wmin = min(wmin, qd);
+            wmax = max(wmax, qd);
+        }
+    }
+    bar_w = max(wmax - wmin, 0.0);
+    T_handle += nh * (0.5 * (wmin + wmax));
+}
+
+// ---------- pinch ----------
+float lat[];
+for (int f = 0; f < 3; f++) lat[f] = dot(root[f] - c0, palm_x_rest);
+float lat_mid = 0.5 * (lat[0] + 0.5 * (lat[1] + lat[2]));
+float g = 0.5 * bar_w + r_link;
+float depth[];
+float pinch_theta[];
+int pinch_fits = 1;
+for (int f = 0; f < 3; f++) {
+    float u_r = dot(root[f] - c0, fwd);
+    float v_r = abs(lat[f] - lat_mid);
+    float L12 = length(mid[f] - root[f]);
+    float L3  = length(tip[f] - mid[f]);
+    float sn = (g - v_r - L3 * sin(psplay)) / max(L12, 1e-6);
+    if (sn > sin(psplay)) {
+        pinch_fits = 0;
+        sn = sin(psplay);
+    }
+    sn = clamp(sn, -1.0, 1.0);
+    float thc = asin(sn);
+    depth[f] = u_r + L12 * cos(thc) + L3 * cos(psplay);
+    pinch_theta[f] = degrees(psplay - thc);
+}
+float pinch_reach = 0.5 * (depth[0] + 0.5 * (depth[1] + depth[2]));
+
+// ---------- approach direction ----------
+float az = radians(rot_deg);
+vector radial = set(cos(az), 0, sin(az));
+float tl = radians(tilt_deg);
+vector fwd_t = normalize(-radial * cos(tl) + set(0, -1, 0) * sin(tl));
+
+// ---------- corridor ----------
+int handle_in_corridor = 0;
+float handle_min_lat = -1;
+if (n_handle > 0) {
+    handle_min_lat = 1e9;
+    for (int i = 0; i < nmug; i++) {
+        if (!hflag[i]) continue;
+        vector rel = point(1, "P", i) - T_body;
+        float along = dot(rel, -fwd_t);
+        if (along > 0) {
+            float perp = length(rel + fwd_t * along);
+            handle_min_lat = min(handle_min_lat, perp);
+            if (perp < hand_halfwidth) handle_in_corridor = 1;
+        }
+    }
+    if (handle_min_lat > 1e8) handle_min_lat = -1;
+}
+
+float ang_t = 180;
+if (n_handle > 0) {
+    vector ah_t = -fwd_t;
+    ah_t.y = 0;
+    if (length(ah_t) > 1e-4)
+        ang_t = degrees(acos(clamp(dot(normalize(ah_t), radial_h), -1.0, 1.0)));
+}
+int handle_frontal = (ang_t <= handle_max_ang);
+int handle_tilt_ok = (tilt_deg <= handle_max_tilt);
+
+int use_handle = 0;
+if (target_mode == 2)      use_handle = (n_handle > 0);
+else if (target_mode == 0) use_handle = handle_in_corridor && handle_frontal && handle_tilt_ok;
+int handle_blocking = (handle_in_corridor && !use_handle);
+
+// ---------- explicit orientation ----------
+// Hand frame at rest: approach f, thumb -> pair axis s, normal u.
+// Target frame: approach fwd_t, s horizontal and perpendicular to the approach
+// (body mode: the fingers wrap the mug from the sides), u = f x s.
+// thumb_side = +1 / -1 chooses on which side the thumb ends up.
+float thumb_side = chf("thumb_side");
+if (thumb_side == 0) thumb_side = 1.0;
+vector fr = normalize(fwd);
+vector sr = palm_x_rest - fr * dot(palm_x_rest, fr);
+if (length(sr) < 1e-6) sr = cross(fr, {0, 1, 0});
+sr = normalize(sr);
+vector ur = normalize(cross(fr, sr));
+vector st = cross({0, 1, 0}, -radial);              // horizontal, perpendicular to the approach
+if (length(st) < 1e-6) st = {0, 0, 1};
+st = normalize(st) * sign(thumb_side);
+st = normalize(st - fwd_t * dot(st, fwd_t));
+vector ut = normalize(cross(fwd_t, st));
+matrix3 Brest = set(fr, sr, ur);
+matrix3 Btgt  = set(fwd_t, st, ut);
+matrix3 R0 = transpose(Brest) * Btgt;
+
+float auto_roll_deg = 0;
+if (use_handle && !manual_roll) {
+    vector px = palm_x_rest * R0;
+    vector a = px - fwd_t * dot(px, fwd_t);
+    vector b = nh - fwd_t * dot(nh, fwd_t);
+    if (length(a) > 1e-3 && length(b) > 1e-3) {
+        a = normalize(a);
+        b = normalize(b);
+        if (dot(a, b) < 0) b = -b;
+        auto_roll_deg = degrees(acos(clamp(dot(a, b), -1.0, 1.0)));
+        R0 = R0 * dihedral(a, b);
+    }
+}
+
+vector raxis = fwd_t;
+if (roll_axis == 1) {
+    raxis = cross({0, 1, 0}, fwd_t);
+    if (length(raxis) < 1e-4) raxis = cross({0, 1, 0}, -radial);
+} else if (roll_axis == 2) {
+    raxis = {0, 1, 0};
+}
+raxis = normalize(raxis);
+
+// ---------- candidates: original + nearby variants (body mode only) ----------
+float droll[] = array(0.0, 20.0, -20.0, 40.0, -40.0, 0.0, 0.0, 20.0, -20.0);
+float dh[]    = array(0.0, 0.0, 0.0, 0.0, 0.0, 0.1, -0.1, 0.1, -0.1);
+int ncand = len(droll);
+if (use_handle || !use_sdf || repair_off) ncand = 1;
+
+matrix3 R = ident();
+vector new_c = 0;
+vector T = 0;
+vector adir = 0;
+vector px_w = 0;
+float glass_extent = -1;
+float roll_used = roll_deg;
+float h_used = h_ratio;
+float open_clear = 1e9;
+int chosen = -1;
+
+for (int k = 0; k < ncand; k++) {
+    float rl = roll_deg + droll[k];
+    float hr = clamp(h_ratio + dh[k], 0.05, 0.95);
+    matrix3 Rr = ident();
+    rotate(Rr, radians(rl), raxis);
+    matrix3 Rc = R0 * Rr;
+    vector ad  = normalize(fwd * Rc);
+    vector pxw = normalize(palm_x_rest * Rc);
+    vector Tc;
+    vector nc;
+    float ge = -1;
+    if (use_handle) {
+        Tc = T_handle;
+        nc = Tc + ad * (tip_over - pinch_reach) - pxw * lat_mid;
+    } else {
+        float ty = bmin.y + hr * H;
+        vector ctr = set(axis_c.x, 0.5 * (bmin.y + bmax.y), axis_c.z);
+        vector offs = set(0.0, ty - ctr.y, 0.0);
+        offs -= ad * dot(offs, ad);
+        Tc = ctr + offs;
+        float s = -1e9;
+        float s_all = 0.0;
+        for (int i = 0; i < nmug; i++) {
+            vector rel = point(1, "P", i) - Tc;
+            float along = dot(rel, -ad);
+            vector perp = rel + ad * along;
+            s_all = max(s_all, along);
+            if (length(perp) < footprint) s = max(s, along);
+        }
+        if (s < -1e8) s = s_all;
+        ge = s;
+        nc = Tc - ad * (s + palm_off);
+    }
+
+    // open hand against the SDF (same criterion as start_collision: 1 mm)
+    float worst = 1e9;
+    if (use_sdf && len(CP) > 0) {
+        // mesh cloud: the same criterion as robotiq_close's start check
+        foreach (vector cp; CP) {
+            vector pp = (cp - c0) * Rc + nc;
+            worst = min(worst, volumesample(2, 0, pp));   // mug
+            worst = min(worst, pp.y - bmin.y);            // table
+        }
+    } else if (use_sdf) {
+        for (int sg = 0; sg < no; sg++) {
+           for (int qs = 1; qs <= 8; qs++) {          // as in robotiq_close: without the root
+                vector pp = (lerp(OA[sg], OB[sg], float(qs) / 8.0) - c0) * Rc + nc;
+                worst = min(worst, volumesample(2, 0, pp) - OR[sg]);   // mug
+                worst = min(worst, (pp.y - OR[sg]) - bmin.y);          // table
+            }
+        }
+    }
+    int clear = (worst >= -open_tol);
+
+    if (k == 0 || clear) {
+        R = Rc;
+        new_c = nc;
+        T = Tc;
+        adir = ad;
+        px_w = pxw;
+        glass_extent = ge;
+        roll_used = rl;
+        h_used = hr;
+        open_clear = worst;
+    }
+    if (clear) {
+        chosen = k;
+        break;
+    }
+}
+
+string gen_status = "ok";
+if (!use_sdf)          gen_status = "no_sdf";
+else if (chosen > 0)   gen_status = "repaired";
+else if (chosen < 0)   gen_status = "no_clear_candidate";
+
+vector place_c = new_c;
+if (pregrasp) place_c += -adir * pre_dist + set(0, pre_lift, 0);
+
+// ---------- apply ----------
+int nsk = npoints(0);
+for (int i = 0; i < nsk; i++) {
+    vector p = point(0, "P", i);
+    matrix3 xf = point(0, "transform", i);
+    setpointattrib(0, "P", i, (p - c0) * R + place_c, "set");
+    setpointattrib(0, "transform", i, xf * R, "set");
+    if (urdf_rig) {
+        vector ja = point(0, "joint_axis", i);
+        vector sa = point(0, "scissor_axis", i);
+        vector sp = point(0, "scissor_pivot", i);
+        setpointattrib(0, "joint_axis",    i, ja * R, "set");
+        setpointattrib(0, "scissor_axis",  i, sa * R, "set");
+        setpointattrib(0, "scissor_pivot", i, (sp - c0) * R + place_c, "set");
+    }
+}
+
+// ---------- outputs ----------
+s@grasp_mode             = use_handle ? "handle" : "body";
+i@target_mode            = target_mode;
+i@handle_in_corridor     = handle_in_corridor;
+f@handle_min_lateral     = handle_min_lat;
+f@hand_halfwidth         = hand_halfwidth;
+f@handle_approach_angle  = ang_t;
+i@handle_frontal         = handle_frontal;
+i@handle_blocking        = handle_blocking;
+f@handle_max_angle       = handle_max_ang;
+v@target_point           = T;
+v@handle_center          = T_handle;
+f@handle_azimuth_deg     = handle_az;
+v@handle_plane_normal    = nh;
+f@handle_bar_width       = bar_w;
+i@handle_auto_roll       = (use_handle && !manual_roll);
+f@handle_auto_roll_deg   = auto_roll_deg;
+f@finger_reach           = reach;
+f@pinch_reach            = pinch_reach;
+f@pinch_lat_mid          = lat_mid;
+f[]@pinch_joint1_est_deg = pinch_theta;
+i@pinch_fits             = pinch_fits;
+f@glass_extent           = glass_extent;
+f@palm_clearance         = palm_off;
+v@palm_pos               = new_c;
+v@palm_pos_applied       = place_c;
+v@approach_dir           = adir;
+f@approach_tilt_deg      = tilt_deg;
+f@approach_rot_deg       = rot_deg;
+f@roll_deg               = roll_used;        // used
+f@roll_deg_sampled       = roll_deg;         // sampled
+i@roll_axis              = roll_axis;
+f@tip_overshoot          = tip_over;
+f@grasp_height_ratio     = h_used;           // used
+f@grasp_height_ratio_sampled = h_ratio;      // sampled
+i@pregrasp               = pregrasp;
+f@pre_dist               = pre_dist;
+f@pre_lift               = pre_lift;
+s@gen_status             = gen_status;
+i@gen_candidate          = chosen;
+f@open_clearance         = open_clear;       // open-hand clearance (m), <0 = penetrating
+i@sample_id              = chi("sample_id");
+f@frame_check            = dot(normalize(fwd * R0), fwd_t);   // must be 1
+i@urdf_rig               = urdf_rig;
+i@open_check_mesh        = (len(CP) > 0);
+i@open_check_points      = len(CP);
+v@thumb_dir              = normalize(palm_x_rest * R);      // thumb -> pair axis used
+s@wrist_version          = "v5.13";
+i@handle_tilt_ok         = handle_tilt_ok;
+f@handle_max_tilt        = handle_max_tilt;

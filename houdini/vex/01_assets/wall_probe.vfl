@@ -1,0 +1,57 @@
+// =========================================================================
+// wall_probe  v1   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/attribwrangle4      in0 = mug_metrics
+// Diagnostic: measures the actual wall of the physics mesh and compares it
+// with the theoretical profile (radiusAt). Goes AFTER mug_metrics (reads its
+// glass_* detail attributes) and BEFORE mug_json (so it ends up in the JSON).
+// Casts rays from the axis towards -X (the side opposite the handle), at 9
+// heights:
+//   r_in  = first hit (inner face), r_out = second hit (outer face)
+// Outputs (arrays): probe_v, probe_y, probe_r_profile, probe_r_in, probe_r_out,
+//                   probe_in_minus_profile_mm, probe_out_minus_profile_mm
+// =========================================================================
+
+function float radiusAt(float v; float r_base; float r_top; float flare_exp; float bulge_amp) {
+    float px = lerp(r_base, r_top, pow(v, flare_exp));
+    px += sin(v * PI) * bulge_amp;
+    return max(px, 0.005);
+}
+
+float h  = detail(0, "glass_h");
+float rb = detail(0, "glass_r_base");
+float rt = detail(0, "glass_r_top");
+float bu = detail(0, "glass_bulge");
+float fl = detail(0, "glass_flare");
+float dy = detail(0, "base_shift");       // 0 if normalize_base is not upstream
+if (fl <= 0) fl = 1.0;
+if (h <= 0) { warning("wall_probe: glass_h = 0 (are the mug_metrics sliders filled in?)"); return; }
+
+vector dir = {-1, 0, 0};
+float vs[], ys[], rp[], ri[], ro[], dI[], dO[];
+for (int k = 1; k <= 9; k++) {
+    float v = k / 10.0;
+    float y = v * h + dy;
+    vector o = set(0, y, 0);
+    vector hp, uvw;
+    float r_in = -1, r_out = -1;
+    int pr = intersect(0, o, dir * 0.5, hp, uvw);
+    if (pr >= 0) {
+        r_in = length(set(hp.x, 0, hp.z));
+        vector o2 = hp + dir * 1e-5;
+        vector hp2;
+        int pr2 = intersect(0, o2, dir * 0.5, hp2, uvw);
+        if (pr2 >= 0) r_out = length(set(hp2.x, 0, hp2.z));
+    }
+    float r_prof = radiusAt(v, rb, rt, fl, bu);
+    append(vs, v); append(ys, y); append(rp, r_prof);
+    append(ri, r_in); append(ro, r_out);
+    append(dI, (r_in  > 0) ? (r_in  - r_prof) * 1000.0 : -999);
+    append(dO, (r_out > 0) ? (r_out - r_prof) * 1000.0 : -999);
+}
+f[]@probe_v = vs;
+f[]@probe_y = ys;
+f[]@probe_r_profile = rp;
+f[]@probe_r_in = ri;
+f[]@probe_r_out = ro;
+f[]@probe_in_minus_profile_mm = dI;
+f[]@probe_out_minus_profile_mm = dO;

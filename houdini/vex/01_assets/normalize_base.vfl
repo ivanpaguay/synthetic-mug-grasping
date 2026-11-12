@@ -1,0 +1,11 @@
+// =========================================================================
+// normalize_base   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/attribwrangle9      in0 = transform7
+// Moves the mug base to y = 0, whatever the wall thickness or direction.
+// =========================================================================
+vector mn, mx;
+getbbox(0, mn, mx);
+float dy = -mn.y;
+for (int i = 0; i < npoints(0); i++)
+    setpointattrib(0, "P", i, point(0, "P", i) + set(0, dy, 0), "set");
+f@base_shift = dy;

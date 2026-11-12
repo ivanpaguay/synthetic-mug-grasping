@@ -1,0 +1,131 @@
+// =========================================================================
+// mug_uv  v1.2   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/mug_uv      in0 = NN, in1 = scene_layout
+// Prints on the mugs. Gives each mug (target and distractor mugs) cylindrical
+// coordinates in ITS own frame and picks a print from the UDIM library
+// ($HIP/textures/mugtex.<UDIM>.png, from pipeline/mug_textures.py).
+//
+// Goes AFTER the whole scene is merged (unpacked mugs + distractors +
+// gripper + table) and BEFORE appearance.
+//   in0 = scene (prims with i@instance_id, s@class, s@part / s@affordance_part)
+//   in1 = scene_layout (points: instance_id, P = position on the table, p@orient)
+// Parameters (0 = default):
+//   scene_id    -> ch("../scene_layout/scene_id")
+//   scene_style -> detail("../scene_params", "scene_style", 0)
+//   tex_count   number of tiles in the library (200)
+//   p_tex       probability that a mug gets a print (0.55; +0.2 in the randomized style)
+// Writes:
+//   v@uv (VERTEX): u = angle around the axis (0..1), v = height / mug height,
+//                  + offset of the chosen UDIM tile (u += k%10, v += k/10)
+//   f@tex_on (prim): 1 where the print shows (body, base and OUTER face of the rim);
+//                    0 on handle, interior, inner face of the rim and anything that is not a mug
+//   i@tex_tile (prim): chosen tile (-1 = plain mug)
+// v1.2: bounded seed (< 1 000 003). With scene_id >= 10000, sid*7919 went past
+//       16.7 million and rand() (float) lost precision: s+7, s+11 and s+13
+//       could give the SAME number (print, tile and rotation correlated)
+// v1.1: diagnostics in the detail (dbg_*) and warnings if no mugs or no layout are found
+// =========================================================================
+int   sid   = chi("scene_id");
+int   style = chi("scene_style");
+int   nt    = chi("tex_count");   if (nt <= 0) nt = 200;
+float pt    = chf("p_tex");       if (pt <= 0) pt = 0.55;
+float p_eff = (style == 1) ? min(1.0, pt + 0.2) : pt;
+
+addvertexattrib(0, "uv", {0, 0, 0});
+addprimattrib(0, "tex_on", 0.0);
+addprimattrib(0, "tex_tile", -1);
+
+// ---------- diagnostics ----------
+int n_mug = 0;
+int n_nolayout = 0;
+string seen[];
+for (int pr = 0; pr < nprimitives(0); pr++) {
+    string c = prim(0, "class", pr);
+    if (find(seen, c) < 0) append(seen, c);
+    if (c == "mug" || c == "target_mug") {
+        n_mug++;
+        int iid0 = prim(0, "instance_id", pr);        // assigned first: prim() as an argument is ambiguous
+        if (findattribval(1, "point", "instance_id", iid0) < 0) n_nolayout++;
+    }
+}
+s[]@dbg_classes_seen = seen;
+i@dbg_mug_prims      = n_mug;
+i@dbg_mug_prims_without_layout_point = n_nolayout;
+i@dbg_layout_points  = npoints(1);
+if (npoints(1) == 0) warning("mug_uv: input 1 (scene_layout) is empty or disconnected");
+if (n_mug == 0) warning("mug_uv: no primitive with class mug/target_mug (missing Unpack or class attribute?)");
+else if (n_nolayout == n_mug) warning("mug_uv: no mug instance_id appears in scene_layout");
+
+// ---------- pass 1: height of each mug in its own frame ----------
+int   ids[];
+float hmax[];
+for (int pr = 0; pr < nprimitives(0); pr++) {
+    string cls = prim(0, "class", pr);
+    if (cls != "mug" && cls != "target_mug") continue;
+    int iid = prim(0, "instance_id", pr);
+    int lp = findattribval(1, "point", "instance_id", iid);
+    if (lp < 0) continue;
+    vector  pos = point(1, "P", lp);
+    vector4 q   = point(1, "orient", lp);        // assigned first: point() inside qinvert() is ambiguous
+    vector4 qi  = qinvert(q);
+    int k = find(ids, iid);
+    if (k < 0) { append(ids, iid); append(hmax, 0.0); k = len(ids) - 1; }
+    foreach (int vt; primvertices(0, pr)) {
+        vector l = qrotate(qi, point(0, "P", vertexpoint(0, vt)) - pos);
+        hmax[k] = max(hmax[k], l.y);
+    }
+}
+
+// ---------- pass 2: uv, tile and mask ----------
+for (int pr = 0; pr < nprimitives(0); pr++) {
+    string cls = prim(0, "class", pr);
+    if (cls != "mug" && cls != "target_mug") continue;
+    int iid = prim(0, "instance_id", pr);
+    int lp = findattribval(1, "point", "instance_id", iid);
+    int k = find(ids, iid);
+    if (lp < 0 || k < 0) continue;
+    vector  pos = point(1, "P", lp);
+    vector4 q   = point(1, "orient", lp);
+    vector4 qi  = qinvert(q);
+    float   H   = max(0.02, hmax[k]);
+
+    // choice per mug (the same for all its primitives)
+    int   s     = (sid * 7919 + iid * 131) % 1000003;   // v1.2: < 2^24, exact as a float
+    float u_on  = rand(s + 7);
+    float u_t   = rand(s + 11);
+    float rot   = rand(s + 13);                     // rotation of the print around the mug
+    int   on    = (u_on < p_eff);
+    int   tile  = on ? min(nt - 1, int(floor(u_t * nt))) : -1;
+    int   tu    = (tile >= 0) ? tile % 10 : 0;
+    int   tv    = (tile >= 0) ? tile / 10 : 0;
+
+    // mask per part
+    string part = "";
+    if (hasprimattrib(0, "affordance_part")) part = prim(0, "affordance_part", pr);
+    if (part == "" && hasprimattrib(0, "part")) part = prim(0, "part", pr);
+    vector cw = primuv(0, "P", pr, {0.5, 0.5});      // primitive centre (world)
+    vector cl = qrotate(qi, cw - pos);
+    float tex = 0.0;
+    if (part == "body" || part == "base") tex = 1.0;
+    if (part == "rim") {
+        vector nl = qrotate(qi, prim_normal(0, pr, {0.5, 0.5}));
+        vector rad = normalize(set(cl.x, 0.0, cl.z));
+        if (dot(nl, rad) > 0.2) tex = 1.0;           // only the outer face of the rim
+    }
+    setprimattrib(0, "tex_on", pr, on ? tex : 0.0);
+    setprimattrib(0, "tex_tile", pr, tile);
+
+    // seamless cylindrical uv: each primitive is unwrapped around its own centre
+    float ca  = atan2(cl.z, cl.x) / (2.0 * M_PI) + 0.5 + rot;
+    float cu  = ca - floor(ca);
+    foreach (int vt; primvertices(0, pr)) {
+        vector l = qrotate(qi, point(0, "P", vertexpoint(0, vt)) - pos);
+        float a = atan2(l.z, l.x) / (2.0 * M_PI) + 0.5 + rot;
+        float d = a - ca;
+        d -= rint(d);                                 // to the turn nearest the centre
+        float u = clamp(cu + d, 0.0005, 0.9995);      // stay inside the UDIM tile
+        float v = clamp(l.y / H, 0.0005, 0.9995);
+        setvertexattrib(0, "uv", -1, vt, set(u + tu, v + tv, 0.0));
+    }
+}
+s@mug_uv_version = "v1.2";

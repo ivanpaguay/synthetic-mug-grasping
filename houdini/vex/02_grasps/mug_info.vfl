@@ -1,0 +1,6 @@
+// mug_info  (Attribute Wrangle, Run Over: Detail)   Houdini node: /obj/geo5/mug_info
+// Tags the grasp sample with its mug and grasp number (set by TOPs).
+int mid = chi("mug_id");
+i@mug_id    = mid;
+i@grasp_num = chi("grasp_num");
+s@mug_dir   = sprintf("mugs/mug_%04d", mid);   // relative to $HIP

@@ -1,0 +1,8 @@
+// =========================================================================
+// table_ids   (Attribute Wrangle)
+// Houdini node: /obj/geo5/attribwrangle10      in0 = box2 (the table)
+// The table is instance 0, class "table".
+// =========================================================================
+i@instance_id = 0;
+s@class = "table";
+s@name  = "table";

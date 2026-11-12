@@ -1,0 +1,42 @@
+// =========================================================================
+// scene_params  v1   (Attribute Wrangle, Run Over: Detail, no inputs)
+// Houdini node: /obj/geo5/scene_params
+// EVERYTHING that is randomized per scene and is not geometry, in one place
+// (a single source of truth for SOPs, Solaris and scene.json).
+//
+// Parameters:
+//   scene_id     -> ch("../scene_layout/scene_id")
+//   hdri_count   number of HDRIs in $HIP/hdri (hdri_00.exr ... )
+//   p_realistic  probability of the realistic style (default 0.7)
+//   use_force    (toggle) 1 = do not randomize the style, use force_style
+//   force_style  0 = realistic / 1 = randomized (only with use_force = 1)
+// Output (detail):
+//   i@scene_style   0 realistic / 1 randomized
+//   i@hdri_index    0 .. hdri_count-1
+//   f@dome_rot      dome light rotation (degrees, Y)
+//   f@dome_exposure dome light exposure (EV)
+// Usage:
+//   appearance  -> scene_style: detail("../scene_params", "scene_style", 0)
+//   Dome Light  -> Texture:
+//      $HIP/hdri/hdri_`padzero(2, detail("/obj/geo5/scene_params", "hdri_index", 0))`.exr
+//      Rotate Y:  detail("/obj/geo5/scene_params", "dome_rot", 0)
+//      Exposure:  detail("/obj/geo5/scene_params", "dome_exposure", 0)
+// =========================================================================
+
+int   sid    = chi("scene_id");
+int   nh     = chi("hdri_count");    if (nh <= 0) nh = 1;
+float p_real = chf("p_realistic");   if (p_real <= 0) p_real = 0.7;
+int   force  = chi("force_style");
+
+int s = sid * 31 + 17;
+float u_style = rand(s + 1);
+int style = (u_style < p_real) ? 0 : 1;
+if (chi("use_force")) style = clamp(force, 0, 1);
+
+float u_h = rand(s + 2);
+i@scene_style   = style;
+i@hdri_index    = min(nh - 1, int(floor(u_h * nh)));
+f@dome_rot      = fit01(rand(s + 3), 0.0, 360.0);
+f@dome_exposure = (style == 0) ? fit01(rand(s + 4), -0.5, 0.5) : fit01(rand(s + 4), -1.5, 1.5);
+i@hdri_count    = nh;
+s@scene_params_version = "v1";

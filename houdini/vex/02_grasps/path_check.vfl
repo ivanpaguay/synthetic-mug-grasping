@@ -1,0 +1,184 @@
+// =========================================================================
+// path_check  v2   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/path_check1
+// Placed BETWEEN wrist_align and robotiq_close.
+// in0 = URDF skeleton posed by wrist_align (grasp pose, pregrasp = 0)
+// in1 = mug SDF (the same VDB robotiq_close uses)
+// in2 = unpacked mug (only for the table height)
+// in3 = finger-link collision point cloud (the same one robotiq_close uses)
+//
+// Sweeps the OPEN hand (the same open pose robotiq_close starts from:
+// joint_1 = lo, joint_2 = lo, joint_3 = hi, scissor from scissor_deg)
+// from the pre-grasp position to the grasp and flags collisions on the way.
+// Without in3 it falls back to capsules (radii from close_node).
+// Parameter close_node: path to robotiq_close (scissor_deg and radii).
+// =========================================================================
+
+int rh_sign() {
+    matrix3 m = ident();
+    rotate(m, 0.5, {0, 0, 1});
+    vector v = {1, 0, 0} * m;
+    return (v.y > 0) ? 1 : -1;
+}
+
+matrix3 rotm(vector axis; float ang; int rh) {
+    matrix3 m = ident();
+    rotate(m, ang * rh, normalize(axis));
+    return m;
+}
+
+// ---------- parameters ----------
+string cn = chs("close_node");
+float scd = (cn != "") ? chf(cn + "/scissor_deg") : chf("scissor_deg");
+float lr  = (cn != "") ? chf(cn + "/link_radius") : 0.0;
+float rp  = (cn != "") ? chf(cn + "/link_radius_prox") : 0.0;
+float rm  = (cn != "") ? chf(cn + "/link_radius_med") : 0.0;
+float rd  = (cn != "") ? chf(cn + "/link_radius_dist") : 0.0;
+if (lr <= 0.0) lr = 0.008;
+if (rp <= 0.0) rp = lr;
+if (rm <= 0.0) rm = lr;
+if (rd <= 0.0) rd = lr;
+float rad[] = array(rp, rm, rd);
+
+float pen_tol = chf("pen_tol");      if (pen_tol <= 0.0) pen_tol = 0.001;
+int   nsteps  = chi("path_steps");   if (nsteps  <= 0)   nsteps  = 20;
+int   RH = rh_sign();
+
+if (!haspointattrib(0, "joint_axis")) {
+    warning("path_check: the skeleton has no joint_axis (URDF rig + wrist_align v5.11+ required)");
+    return;
+}
+
+// ---------- table and trajectory ----------
+float table_y = -1e9;
+if (npoints(2) > 0) {
+    vector bmin;
+    vector bmax;
+    getbbox(2, bmin, bmax);
+    table_y = bmin.y;
+}
+vector adir = detail(0, "approach_dir");
+float pre_dist = detail(0, "pre_dist");
+float pre_lift = detail(0, "pre_lift");
+if (pre_dist <= 0.0) pre_dist = 0.08;
+if (length(adir) < 1e-6) {
+    warning("path_check: approach_dir is missing (is wrist_align upstream of this node?)");
+    return;
+}
+vector off0 = -normalize(adir) * pre_dist + set(0.0, pre_lift, 0.0);
+
+int use_mesh = (npoints(3) > 0 && haspointattrib(3, "lp"));
+int has_ok = haspointattrib(3, "prep_ok");
+
+// ---------- open hand at the grasp pose ----------
+vector Q[];      // cloud points (or capsule samples) in world space
+float  QR[];     // radius of each sample (0 for the cloud)
+string chains[] = array("chain_thumb", "chain_ring", "chain_index");
+for (int ci = 0; ci < 3; ci++) {
+    int ids[];
+    vector p[];
+    for (int i = 0; i < npoints(0); i++) {
+        string c = point(0, "chain", i);
+        if (c == chains[ci]) {
+            vector pos = point(0, "P", i);
+            append(ids, i);
+            append(p, pos);
+        }
+    }
+    if (len(ids) != 4) continue;
+
+    vector ax[];
+    float dq[];
+    for (int k = 0; k < 3; k++) {
+        vector a = point(0, "joint_axis", ids[k]);
+        ax[k] = normalize(a);
+        float qr  = point(0, "joint_q",  ids[k]);
+        float qlo = point(0, "joint_lo", ids[k]);
+        float qhi = point(0, "joint_hi", ids[k]);
+        dq[k] = ((k == 2) ? qhi : qlo) - qr;
+    }
+    // scissor first (as in robotiq_close)
+    matrix3 Ms = ident();
+    string sct = point(0, "scissor_type", ids[0]);
+    string bjn = point(0, "urdf_base_joint", ids[0]);
+    if (sct == "revolute") {
+        float sgn = (bjn == "palm_finger_2_joint") ? -1.0 : 1.0;
+        float slo = point(0, "scissor_lo", ids[0]);
+        float shi = point(0, "scissor_hi", ids[0]);
+        float sr  = point(0, "scissor_q",  ids[0]);
+        float st  = clamp(sgn * radians(scd), slo, shi);
+        vector spv = point(0, "scissor_pivot", ids[0]);
+        vector sax = point(0, "scissor_axis",  ids[0]);
+        Ms = rotm(sax, st - sr, RH);
+        for (int j = 0; j < 4; j++) p[j] = spv + (p[j] - spv) * Ms;
+        for (int k = 0; k < 3; k++) ax[k] = ax[k] * Ms;
+    }
+    // open pose
+    matrix3 M[];
+    for (int j = 0; j < 4; j++) M[j] = ident();
+    for (int k = 0; k < 3; k++) {
+        matrix3 m = rotm(ax[k], dq[k], RH);
+        for (int j = k + 1; j < 4; j++) p[j] = p[k] + (p[j] - p[k]) * m;
+        for (int j = k + 1; j < 3; j++) ax[j] = ax[j] * m;
+        for (int j = k; j < 4; j++) M[j] = M[j] * m;
+    }
+    for (int k = 0; k < 3; k++) {
+        if (use_mesh) {
+            string nk = point(0, "name", ids[k]);
+            matrix3 xr = point(0, "transform", ids[k]);
+            matrix3 X = xr * Ms * M[k];
+            for (int i = 0; i < npoints(3); i++) {
+                int okp = 1;
+                if (has_ok) okp = point(3, "prep_ok", i);
+                if (!okp) continue;
+                string jn = point(3, "joint_name", i);
+                if (jn != nk) continue;
+                vector l = point(3, "lp", i);
+                append(Q, l * X + p[k]);
+                append(QR, 0.0);
+            }
+        } else {
+            for (int s = 1; s <= 8; s++) {
+                append(Q, lerp(p[k], p[k + 1], float(s) / 8.0));
+                append(QR, rad[k]);
+            }
+        }
+    }
+}
+
+// ---------- sweep: t = 0 pre-grasp, t = 1 grasp ----------
+int   path_col   = 0;
+int   path_table = 0;
+float path_pen   = 0.0;
+float first_bad  = -1.0;
+for (int it = 0; it < nsteps; it++) {          // t = 1 is evaluated by robotiq_close
+    float t = float(it) / nsteps;
+    vector off = off0 * (1.0 - t);
+    int bad = 0;
+    for (int i = 0; i < len(Q); i++) {
+        vector q = Q[i] + off;
+        float g = volumesample(1, 0, q) - QR[i];
+        if (g < -pen_tol) {
+            path_col = 1;
+            path_pen = max(path_pen, -g);
+            bad = 1;
+        }
+        if (q.y - QR[i] < table_y - pen_tol) {
+            path_table = 1;
+            bad = 1;
+        }
+    }
+    if (bad && first_bad < 0.0) first_bad = t;
+}
+
+// ---------- outputs ----------
+i@path_collision     = path_col;
+i@path_table_hit     = path_table;
+i@palm_collision     = 0;
+i@palm_checked       = 0;
+f@path_pen_depth     = path_pen;
+f@path_first_bad_t   = first_bad;     // -1 = clear path
+f@path_pre_dist      = pre_dist;
+i@path_check_mesh    = use_mesh;
+i@path_check_points  = len(Q);
+s@path_check_version = "v2";

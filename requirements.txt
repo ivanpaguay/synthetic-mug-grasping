@@ -1,0 +1,8 @@
+# training and evaluation environment (Python 3.11, CUDA build of torch recommended)
+torch>=2.3
+torchvision>=0.18
+transformers>=4.44
+numpy>=1.26
+Pillow>=10.0
+# dataset build (run with Isaac Sim's python.bat, or install here)
+OpenEXR>=3.2

@@ -1,0 +1,145 @@
+// =========================================================================
+// affordances  v8   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/affordances1      in0 = gws_check
+//
+// Which tasks is this grasp good for? (lift, pour, place, handover;
+// design criteria of this project)
+// Every affordance requires a usable sample: valid grasp + clear approach path.
+//
+// - A finger INSIDE the mug (inner wall or bottom, "interior" part) blocks
+//   POUR: the hand would sit in the liquid / in the stream. Lift, place and
+//   handover are unaffected (grasping from inside works with an empty mug).
+// - POUR needs a free ARC of the rim for the stream (pour_min_free_arc,
+//   default 90 deg) and an unblocked mouth on the pouring side
+//   (pour_path_blocked from grasp_contacts). Requiring the whole rim to be
+//   free blocked 100 % of grasps with the Robotiq 3F, whose palm sits above
+//   the mug.
+// - PLACE needs the base free.
+// - HANDOVER needs the handle free, or a free band above or below the fingers
+//   for the receiver's hand.
+// - aff_*_geo / aff_tasks_geo: the same criteria from geometry only, without
+//   requiring the geometric grasp check to pass. The physics test in Isaac
+//   can validate grasps that the geometric check rejected; the merge step
+//   assigns them these tasks.
+// Note: the reason strings (e.g. "muestra_no_utilizable" = sample not usable)
+// are kept as in the released data.
+// =========================================================================
+
+int usable   = detail(0, "sample_valid");
+int c_handle = detail(0, "contacts_handle");
+int c_rim    = detail(0, "contacts_rim");
+int c_base   = detail(0, "contacts_base");
+int c_upper  = detail(0, "contacts_upper");
+int c_lower  = detail(0, "contacts_lower");
+int n_rim    = detail(0, "near_rim");
+int n_base   = detail(0, "near_base");
+int path_checked = hasdetailattrib(0, "pour_path_blocked");
+int o_block  = path_checked ? detail(0, "pour_path_blocked") : detail(0, "opening_blocked");
+i@aff_pour_path_checked = path_checked;
+int pour_needs_handle = chi("pour_requires_handle");   // 0 = pouring does not require the handle
+
+// contacts inside the mug
+int interior_checked = hasdetailattrib(0, "contacts_interior");
+int c_interior = interior_checked ? detail(0, "contacts_interior") : 0;
+if (!interior_checked)
+    warning("affordances: contacts_interior is missing (is grasp_contacts v2.1+ upstream?)");
+i@aff_interior_checked = interior_checked;
+
+// ---------- lift ----------
+i@aff_lift = usable;
+s@aff_lift_reason = usable ? "ok" : "muestra_no_utilizable";
+
+// ---------- pour: interior and mouth free + one free arc of the rim ----------
+int   arc_checked = hasdetailattrib(0, "rim_free_arc_deg");
+float free_arc    = arc_checked ? detail(0, "rim_free_arc_deg") : -1.0;
+float min_arc     = chf("pour_min_free_arc");  if (min_arc <= 0) min_arc = 90.0;
+if (!arc_checked)
+    warning("affordances: rim_free_arc_deg is missing (grasp_contacts v2.2+?): using the older rim rule");
+i@aff_rim_arc_checked = arc_checked;
+f@pour_min_free_arc   = min_arc;
+
+string why_pour = "ok";
+if (!usable)                                why_pour = "muestra_no_utilizable";    // sample not usable
+else if (c_interior > 0)                    why_pour = "dedo_dentro_de_la_taza";   // finger inside the mug
+else if (o_block)                           why_pour = "boca_tapada";              // mouth blocked
+else if (arc_checked && free_arc < min_arc) why_pour = "borde_sin_sector_libre";   // no free rim arc
+else if (!arc_checked && c_rim > 0)         why_pour = "contacto_en_borde";        // contact on rim (older rule)
+else if (!arc_checked && n_rim)             why_pour = "dedo_cerca_del_borde";     // finger near rim (older rule)
+else if (pour_needs_handle && c_handle == 0) why_pour = "sin_asa";                 // no handle contact
+i@aff_pour = (why_pour == "ok");
+s@aff_pour_reason = why_pour;
+
+// ---------- place: the base must stay free ----------
+string why_place = "ok";
+if (!usable)         why_place = "muestra_no_utilizable";
+else if (c_base > 0) why_place = "contacto_en_base";       // contact on base
+else if (n_base)     why_place = "dedo_cerca_de_base";     // finger near base
+i@aff_place = (why_place == "ok");
+s@aff_place_reason = why_place;
+
+// ---------- handover: the receiver needs the handle or a free band ----------
+int   has_handle = detail(0, "has_handle");
+int   n_handle   = detail(0, "near_handle");
+float ybot       = detail(0, "mug_ybot");
+float ytop       = detail(0, "mug_ytop");
+vector cp[]      = detail(0, "c_pos");
+float rads[]     = detail(0, "link_radii");
+float band = chf("handover_band");          // minimum free band (project criterion)
+if (band <= 0) band = 0.04;
+
+float rr = 0.0;
+foreach (float rv; rads) rr = max(rr, rv);
+float cmin = 1e9;
+float cmax = -1e9;
+foreach (vector p; cp) {
+    cmin = min(cmin, p.y);
+    cmax = max(cmax, p.y);
+}
+float free_top = ytop - (cmax + rr);
+float free_bot = (cmin - rr) - ybot;
+int handle_free = has_handle && c_handle == 0 && !n_handle;
+
+string why_hand = "ok";
+string via = "-";
+if (!usable) {
+    why_hand = "muestra_no_utilizable";
+} else if (handle_free) {
+    via = "asa";                         // via the handle
+} else if (free_top >= band) {
+    via = "franja_superior";             // via the upper band
+} else if (free_bot >= band) {
+    via = "franja_inferior";             // via the lower band
+} else {
+    why_hand = "sin_zona_libre_para_receptor";   // no free zone for the receiver
+}
+i@aff_handover = (why_hand == "ok");
+s@aff_handover_reason = why_hand;
+s@aff_handover_via = via;
+f@handover_free_top = free_top;
+f@handover_free_bottom = free_bot;
+
+// ---------- summary ----------
+string tasks = "";
+if (i@aff_lift)     tasks += "lift ";
+if (i@aff_pour)     tasks += "pour ";
+if (i@aff_place)    tasks += "place ";
+if (i@aff_handover) tasks += "handover ";
+s@aff_tasks = tasks == "" ? "ninguna" : strip(tasks);     // "ninguna" = none
+i@aff_count = i@aff_lift + i@aff_pour + i@aff_place + i@aff_handover;
+s@affordances_version = "v8";
+
+// ---------- the same tasks from geometry only ----------
+int g_pour = (c_interior == 0) && !o_block
+             && (arc_checked ? (free_arc >= min_arc) : (c_rim == 0 && !n_rim))
+             && !(pour_needs_handle && c_handle == 0);
+int g_place = (c_base == 0) && !n_base;
+int g_hand  = handle_free || free_top >= band || free_bot >= band;
+i@aff_lift_geo     = 1;
+i@aff_pour_geo     = g_pour;
+i@aff_place_geo    = g_place;
+i@aff_handover_geo = g_hand;
+string tg = "lift ";
+if (g_pour)  tg += "pour ";
+if (g_place) tg += "place ";
+if (g_hand)  tg += "handover ";
+s@aff_tasks_geo = strip(tg);

@@ -1,0 +1,363 @@
+// =========================================================================
+// robotiq_close  v8.2   ROBOTIQ 3F - SEQUENTIAL CLOSING UNTIL BLOCKED  (Run Over: Detail)
+// Houdini node: /obj/geo5/robotiq_close4
+// Input 0: URDF skeleton (urdf_skeleton v1.2+) posed by wrist_align.
+// Input 1: mug SDF (VDB).
+// Input 2: finger-link collision point cloud (link_collision_prep).
+//          Without input 2 -> capsules.
+//
+// Kinematics from the URDF: each link turns about its real axis (joint_axis)
+// at its real joint, within its real limits (joint_lo / joint_hi).
+//   - the most proximal free joint moves first;
+//   - a contact on link k locks joints 0..k;
+//   - if the distal link touches, the finger stops;
+//   - parallel tip (ROS model): joint_3 = -joint_1 while the base turns;
+//   - start check: penetration > 1 mm with the hand open.
+// Open pose = joint_1 at its lower limit, joint_2 = 0, joint_3 at its upper
+// limit, scissor from scissor_deg (the SAME open hand wrist_align filters with).
+// Collision uses the URDF collision MESHES (a point cloud per link):
+// gap = SDF at the closest point; contact: gap < contact_tol (1 mm);
+// penetration: gap < -pen_tol. On touching, the finger STAYS at the contact
+// pose; if some link penetrates more than pen_tol in that step, the pose
+// between the previous and the new step is found by bisection.
+// joint_angle is written in ABSOLUTE URDF degrees (the same as in Isaac Sim).
+// Obsolete parameters (unused): open_splay_deg, distal_in_deg.
+// =========================================================================
+
+// sign of rotate(): +1 if it turns right-handed (URDF convention)
+int rh_sign() {
+    matrix3 m = ident();
+    rotate(m, 0.5, {0, 0, 1});
+    vector v = {1, 0, 0} * m;
+    return (v.y > 0) ? 1 : -1;
+}
+
+matrix3 rotm(vector axis; float ang; int rh) {
+    matrix3 m = ident();
+    rotate(m, ang * rh, normalize(axis));
+    return m;
+}
+
+// forward kinematics of one finger: b = points _01.._04 at q_rest, ax = axes
+// of joint_1..3 at q_rest. Returns positions and the accumulated rotation of
+// each point (for its transform).
+void chain_fk(vector b[]; vector ax[]; float qr[]; float q[]; int rh;
+              vector out[]; matrix3 M[]) {
+    out = b;
+    vector A[] = ax;
+    resize(M, 4);
+    for (int j = 0; j < 4; j++) M[j] = ident();
+    for (int k = 0; k < 3; k++) {
+        matrix3 m = rotm(A[k], q[k] - qr[k], rh);
+        for (int j = k + 1; j < 4; j++) out[j] = out[k] + (out[j] - out[k]) * m;
+        for (int j = k + 1; j < 3; j++) A[j] = A[j] * m;
+        for (int j = k; j < 4; j++) M[j] = M[j] * m;
+    }
+}
+
+// minimum distance from a link's cloud to the mug (and the point that gives it)
+float link_min_mesh(vector LP[]; int s0; int n; vector P; matrix3 X; vector best) {
+    float smin = 1e9;
+    for (int i = s0; i < s0 + n; i++) {
+        vector w = LP[i] * X + P;
+        float d = volumesample(1, 0, w);
+        if (d < smin) {
+            smin = d;
+            best = w;
+        }
+    }
+    return smin;
+}
+
+float link_min_sdf(vector a; vector b; int nsmp) {
+    float smin = 1e9;
+    for (int s = 1; s <= nsmp; s++) {
+        vector sp = lerp(a, b, float(s) / nsmp);
+        smin = min(smin, volumesample(1, 0, sp));
+    }
+    return smin;
+}
+
+// gap of a finger's 3 links for the angles q
+void finger_gaps(vector p[]; vector ax[]; float qr[]; float q[]; int rh;
+                 vector LP[]; int lst[]; int lcn[]; float reff[]; float rad[];
+                 matrix3 xr[]; matrix3 Ms; int nsmp; float tm[]) {
+    vector fk[];
+    matrix3 Mk[];
+    chain_fk(p, ax, qr, q, rh, fk, Mk);
+    vector bp;
+    resize(tm, 3);
+    for (int k = 0; k < 3; k++) {
+        if (reff[k] == 0.0 && lcn[k] > 0)
+            tm[k] = link_min_mesh(LP, lst[k], lcn[k], fk[k], xr[k] * Ms * Mk[k], bp);
+        else
+            tm[k] = link_min_sdf(fk[k], fk[k + 1], nsmp) - rad[k];
+    }
+}
+
+// ---------- parameters ----------
+int   use_frame   = chi("use_frame");
+float close_start = chf("close_start");
+float close_end   = chf("close_end");
+float scissor_deg = chf("scissor_deg");
+float link_radius = chf("link_radius");
+float r_prox      = chf("link_radius_prox");
+float r_med       = chf("link_radius_med");
+float r_dist      = chf("link_radius_dist");
+float step_deg    = chf("step_deg");
+int   no_parallel = chi("no_parallel_tip");
+float ctol        = chf("contact_tol");     // contact (mesh), m
+float ptol        = chf("pen_tol");         // tolerated penetration, m
+if (ctol <= 0.0) ctol = 0.001;
+if (ptol <= 0.0) ptol = 0.001;
+int use_mesh = (npoints(2) > 0 && haspointattrib(2, "lp"));
+int has_ok = haspointattrib(2, "prep_ok");
+if (link_radius <= 0.0) link_radius = 0.008;
+if (r_prox <= 0.0)      r_prox = link_radius;
+if (r_med  <= 0.0)      r_med  = link_radius;
+if (r_dist <= 0.0)      r_dist = link_radius;
+if (step_deg <= 0.0)    step_deg = 0.5;
+float rad[] = array(r_prox, r_med, r_dist);
+float stp = radians(step_deg);
+float frac = 1.0;
+if (use_frame) frac = clamp(fit(@Frame, close_start, close_end, 0.0, 1.0), 0.0, 1.0);
+int RH = rh_sign();
+int nsmp = 8;
+
+if (!haspointattrib(0, "joint_axis")) {
+    error("robotiq_close: the skeleton has no joint_axis (use urdf_skeleton v1.2+ and wrist_align v5.11+)");
+    return;
+}
+
+string chains[] = array("chain_thumb", "chain_ring", "chain_index");
+float scissor_used = 0.0;
+
+for (int ci = 0; ci < 3; ci++) {
+    int ids[];
+    vector p[];
+    matrix3 xr[];
+    for (int i = 0; i < npoints(0); i++) {
+        string c = point(0, "chain", i);
+        if (c == chains[ci]) {
+            vector pos = point(0, "P", i);
+            matrix3 xm = point(0, "transform", i);
+            append(ids, i);
+            append(p, pos);
+            append(xr, xm);
+        }
+    }
+    if (len(ids) != 4) continue;
+
+    vector ax[];
+    float qr[];
+    float qlo[];
+    float qhi[];
+    for (int k = 0; k < 3; k++) {
+        vector a = point(0, "joint_axis", ids[k]);
+        ax[k]  = normalize(a);
+        qr[k]  = point(0, "joint_q",  ids[k]);
+        qlo[k] = point(0, "joint_lo", ids[k]);
+        qhi[k] = point(0, "joint_hi", ids[k]);
+    }
+
+    // ---------- collision cloud of each link ----------
+    vector LP[];
+    int lst[] = array(0, 0, 0);
+    int lcn[] = array(0, 0, 0);
+    if (use_mesh) {
+        for (int k = 0; k < 3; k++) {
+            string nk = point(0, "name", ids[k]);
+            lst[k] = len(LP);
+            for (int i = 0; i < npoints(2); i++) {
+                int okp = 1;
+                if (has_ok) okp = point(2, "prep_ok", i);
+                if (!okp) continue;                                   // rejected by link_collision_prep
+                string jn = point(2, "joint_name", i);
+                if (jn == nk) {
+                    vector l = point(2, "lp", i);
+                    append(LP, l);
+                }
+            }
+            lcn[k] = len(LP) - lst[k];
+        }
+    }
+    // gap of each link: mesh if its cloud exists; otherwise a capsule
+    float reff[];
+    float ceff[];
+    for (int k = 0; k < 3; k++) {
+        int mk = (use_mesh && lcn[k] > 0);
+        reff[k] = mk ? 0.0 : rad[k];
+        ceff[k] = mk ? ctol : 0.0;
+    }
+
+    // ---------- scissor (the whole finger turns about its base) ----------
+    matrix3 Ms = ident();
+    string sct = point(0, "scissor_type", ids[0]);
+    string bjn = point(0, "urdf_base_joint", ids[0]);
+    if (sct == "revolute") {
+        float sgn = (bjn == "palm_finger_2_joint") ? -1.0 : 1.0;
+        float slo = point(0, "scissor_lo", ids[0]);
+        float shi = point(0, "scissor_hi", ids[0]);
+        float sr  = point(0, "scissor_q",  ids[0]);
+        float st  = clamp(sgn * radians(scissor_deg), slo, shi);
+        vector spv = point(0, "scissor_pivot", ids[0]);
+        vector sax = point(0, "scissor_axis",  ids[0]);
+        Ms = rotm(sax, st - sr, RH);
+        for (int j = 0; j < 4; j++) p[j] = spv + (p[j] - spv) * Ms;
+        for (int k = 0; k < 3; k++) ax[k] = ax[k] * Ms;
+        if (sgn > 0) scissor_used = degrees(st);
+        // the finger base (_00) turns with the scissor
+        string nm0 = point(0, "name", ids[0]);
+        int p00 = findattribval(0, "point", "name", re_replace("_01$", "_00", nm0));
+        if (p00 >= 0) {
+            matrix3 x00 = point(0, "transform", p00);
+            setpointattrib(0, "transform", p00, x00 * Ms, "set");
+        }
+    }
+
+    // ---------- open pose ----------
+    float q[] = array(qlo[0], qlo[1], qhi[2]);
+    int lock[] = array(0, 0, 0);
+    int cl[]   = array(0, 0, 0);
+    int start_col = 0;
+
+    vector fk[];
+    matrix3 Mk[];
+    chain_fk(p, ax, qr, q, RH, fk, Mk);
+    float sm[];
+    vector bp;
+    for (int k = 0; k < 3; k++) {
+        if (reff[k] == 0.0 && lcn[k] > 0)
+            sm[k] = link_min_mesh(LP, lst[k], lcn[k], fk[k], xr[k] * Ms * Mk[k], bp);
+        else
+            sm[k] = link_min_sdf(fk[k], fk[k + 1], nsmp) - rad[k];
+    }
+    int sc_any = 0;
+    for (int k = 0; k < 3; k++) if (sm[k] < -ptol) sc_any = 1;
+    if (sc_any) {
+        start_col = 1;
+    } else {
+        for (int k = 0; k < 3; k++) {
+            if (sm[k] < ceff[k]) {
+                cl[k] = 1;
+                for (int j = 0; j <= k; j++) lock[j] = 1;
+            }
+        }
+    }
+
+    // ---------- sequential closing ----------
+    int maxsteps = int(((qhi[0] - qlo[0]) + (qhi[1] - qlo[1]) + (qhi[2] - qlo[2])) / stp) + 10;
+    int nsteps = int(maxsteps * frac);
+    int steps_done = 0;
+    if (!start_col && !lock[2]) {
+        for (int it = 0; it < nsteps; it++) {
+            int jm = -1;
+            for (int k = 0; k < 3; k++) {
+                if (!lock[k] && q[k] < qhi[k] - 1e-6) {
+                    jm = k;
+                    break;
+                }
+            }
+            if (jm < 0) break;
+
+            float qold[] = q;
+            q[jm] = min(q[jm] + stp, qhi[jm]);
+            // parallel tip (ROS joint_states): the distal link compensates the base
+            if (!no_parallel && jm == 0 && !lock[2]) q[2] = clamp(-q[0], qlo[2], qhi[2]);
+
+            chain_fk(p, ax, qr, q, RH, fk, Mk);
+            float tm[];
+            for (int k = 0; k < 3; k++) {
+                if (reff[k] == 0.0 && lcn[k] > 0)
+                    tm[k] = link_min_mesh(LP, lst[k], lcn[k], fk[k], xr[k] * Ms * Mk[k], bp);
+                else
+                    tm[k] = link_min_sdf(fk[k], fk[k + 1], nsmp) - rad[k];
+            }
+            int newhit = -1;
+            for (int k = 2; k >= 0; k--) {
+                if (tm[k] < ceff[k] && !cl[k]) {
+                    newhit = k;
+                    break;
+                }
+            }
+            if (newhit >= 0) {
+                // stay at the contact pose; if something penetrates, bisect
+                if (min(tm) < -ptol) {
+                    float qa[] = qold;
+                    float qb[] = q;
+                    float t0 = 0.0;
+                    float t1 = 1.0;
+                    for (int b = 0; b < 10; b++) {
+                        float tmid = 0.5 * (t0 + t1);
+                        float qm[];
+                        for (int k = 0; k < 3; k++) qm[k] = lerp(qa[k], qb[k], tmid);
+                        float gm[];
+                        finger_gaps(p, ax, qr, qm, RH, LP, lst, lcn, reff, rad, xr, Ms, nsmp, gm);
+                        if (min(gm) < -ptol) t1 = tmid;
+                        else t0 = tmid;
+                    }
+                    for (int k = 0; k < 3; k++) q[k] = lerp(qa[k], qb[k], t0);
+                    finger_gaps(p, ax, qr, q, RH, LP, lst, lcn, reff, rad, xr, Ms, nsmp, tm);
+                }
+                for (int k = 0; k < 3; k++) if (tm[k] < ceff[k] + 1e-6) cl[k] = 1;
+                for (int j = 0; j <= newhit; j++) lock[j] = 1;
+                if (newhit == 2) break;
+            }
+            steps_done = it + 1;
+        }
+    }
+
+    // ---------- final pose ----------
+    vector wp[];
+    matrix3 Mf[];
+    chain_fk(p, ax, qr, q, RH, wp, Mf);
+    for (int i = 0; i < 4; i++) {
+        setpointattrib(0, "P", ids[i], wp[i], "set");
+        setpointattrib(0, "transform", ids[i], xr[i] * Ms * Mf[i], "set");
+    }
+
+    // ---------- contacts ----------
+    for (int k = 0; k < 3; k++) {
+        float smin = 1e9;
+        vector best = wp[k];
+        int inc = 0;
+        float gapk = 0.0;
+        if (reff[k] == 0.0 && lcn[k] > 0) {
+            smin = link_min_mesh(LP, lst[k], lcn[k], wp[k], xr[k] * Ms * Mf[k], best);
+            gapk = smin;
+            inc = (cl[k] || gapk < ctol * 1.5) ? 1 : 0;
+        } else {
+            for (int s = 0; s <= nsmp; s++) {
+                vector sp = lerp(wp[k], wp[k + 1], float(s) / nsmp);
+                float sd = volumesample(1, 0, sp);
+                if (sd < smin) {
+                    smin = sd;
+                    best = sp;
+                }
+            }
+            gapk = smin - rad[k];
+            inc = (cl[k] || smin < rad[k] * 1.2) ? 1 : 0;
+        }
+        vector gr = normalize(volumegradient(1, 0, best));
+        setpointattrib(0, "in_contact",  ids[k], inc,              "set");
+        setpointattrib(0, "contact_pos", ids[k], best - gr * smin, "set");
+        setpointattrib(0, "contact_nrm", ids[k], gr,               "set");
+        setpointattrib(0, "contact_sdf", ids[k], smin,             "set");
+        setpointattrib(0, "contact_gap", ids[k], gapk,             "set");   // >0 free, <0 penetrating
+        setpointattrib(0, "joint_angle", ids[k], degrees(q[k]),    "set");   // absolute URDF degrees
+        setpointattrib(0, "joint_q",     ids[k], q[k],             "set");   // absolute URDF radians
+    }
+    setpointattrib(0, "g_final",         ids[3], 255.0 * steps_done / maxsteps, "set");
+    setpointattrib(0, "start_collision", ids[3], start_col, "set");
+}
+
+if (use_mesh) f[]@link_radii = array(0.0, 0.0, 0.0);   // 0 = mesh collision
+else          f[]@link_radii = rad;
+i@collision_mesh        = use_mesh;
+f@contact_tol           = ctol;
+f@pen_tol               = ptol;
+f@scissor_used_deg      = scissor_used;
+i@parallel_tip          = !no_parallel;
+i@rotate_handedness     = RH;
+s@joint_angle_units     = "deg_absolute_urdf";
+s@robotiq_close_version = "v8.2";

@@ -1,0 +1,50 @@
+// =========================================================================
+// mug_instances  v1   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/mug_instances      in1 = scene_layout
+// The MUGS of the scene (target + distractor mugs) without a For-Each.
+// Creates one packed disk primitive per point of class mug / target_mug,
+// pointing to its mug_render.bgeo.sc, with the point's position and rotation.
+//
+// Inputs:
+//   in0 = (empty)
+//   in1 = scene_layout v1
+// Parameters:
+//   mugs_dir (string)  -> set to:  $HIP/mugs
+//   file_name (string) -> optional; default mug_render.bgeo.sc
+// Output: packed primitives with i@instance_id, s@class, s@name,
+//   i@ref_mug_id. To see them as a mesh: Unpack SOP with
+//   "Transfer Attributes" = instance_id class name ref_mug_id
+//   (the mug also carries its part attributes: affordance_part / part).
+// =========================================================================
+
+string mdir  = chs("mugs_dir");
+string fname = chs("file_name");
+if (fname == "") fname = "mug_render.bgeo.sc";
+if (mdir == "") {
+    error("mug_instances: set the mugs_dir parameter to $HIP/mugs");
+    return;
+}
+
+int n = 0;
+for (int i = 0; i < npoints(1); i++) {
+    string cls = point(1, "class", i);
+    if (cls != "mug" && cls != "target_mug") continue;
+    vector  P    = point(1, "P", i);
+    vector4 q    = point(1, "orient", i);
+    int     ref  = point(1, "ref_mug_id", i);
+    int     inst = point(1, "instance_id", i);
+
+    string path = sprintf("%s/mug_%04d/%s", mdir, ref, fname);
+    int pt = addpoint(0, P);
+    int pr = addprim(0, "PackedDisk", pt);
+    setprimintrinsic(0, "unexpandedfilename", pr, path);
+    matrix3 m = qconvert(q);                      // explicit type: qconvert is overloaded
+    setprimintrinsic(0, "transform", pr, m);
+    setprimattrib(0, "instance_id", pr, inst);
+    setprimattrib(0, "class",       pr, cls);
+    setprimattrib(0, "name",        pr, sprintf("obj_%02d_%s", inst, cls));
+    setprimattrib(0, "ref_mug_id",  pr, ref);
+    n++;
+}
+i@mug_instances = n;
+s@mug_instances_version = "v1";

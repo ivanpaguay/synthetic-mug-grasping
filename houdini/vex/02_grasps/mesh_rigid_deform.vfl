@@ -1,0 +1,33 @@
+// =========================================================================
+// mesh_rigid_deform  v1.1   (Attribute Wrangle, Run Over: Points)
+// Houdini node: /obj/geo5/mesh_rigid_deform
+// Moves the VISIBLE gripper mesh with the same rigid rule robotiq_close uses
+// for its collision cloud, so the rendered gripper matches the tested pose.
+//
+// in0 = visible mesh in zero pose, passed through link_collision_prep with
+//       include_fixed = 1 and delete_bad = 0 (carries v@lp and s@joint_name)
+// in1 = posed skeleton (output of robotiq_close)
+//
+// Points are never deleted (that would remove the mesh faces). A point that
+// cannot be moved stays in place and is flagged: i@deform_ok = 0, s@deform_reason.
+// =========================================================================
+i@deform_ok = 0;
+if (!haspointattrib(0, "lp") || !haspointattrib(0, "joint_name")) {
+    s@deform_reason = "mesh has no lp/joint_name: was it passed through link_collision_prep?";
+    return;
+}
+if (s@joint_name == "") {
+    s@deform_reason = "point rejected by link_collision_prep (see its prep_reason)";
+    return;
+}
+int j = findattribval(1, "point", "name", s@joint_name);
+if (j < 0) {
+    s@deform_reason = "the skeleton on input 1 has no point '" + s@joint_name + "'";
+    return;
+}
+vector pj = point(1, "P", j);
+matrix3 X = point(1, "transform", j);
+@P = v@lp * X + pj;
+i@deform_ok = 1;
+s@deform_reason = "ok";
+// normals: recompute them afterwards with a Normal SOP

@@ -1,0 +1,383 @@
+// =========================================================================
+// grasp_contacts  v2.3   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/grasp_contacts1
+// in0 = robotiq_close output (closed skeleton)
+// in1 = unpacked mug with zones (s@part or Cd)
+// in2 = mug SDF (the same VDB robotiq_close uses)
+// in3 = finger-link collision cloud (the same one robotiq_close uses)
+//       Without in3 -> capsules with f[]@link_radii.
+//
+// Tolerances (DexGraspNet-style criteria):
+//   contact     : link surface within 1 mm of the object
+//   penetration : the link enters the object by more than 1 mm -> invalid
+// Each link is its mesh point cloud, placed with its joint transform (the
+// same rule as robotiq_close and Isaac Sim). One contact per link: the cloud
+// point closest to the mug. Zones come from the mug's part labels
+// (handle, rim, base, interior, body).
+//
+// RIM SECTORS: the rim is split into 36 sectors of 10 deg around the axis; a
+// sector is occupied if any link passes within keep_clear of the 'rim' zone
+// at that angle. Outputs:
+//   f@rim_free_arc_deg     longest continuous free arc (0-360 deg)
+//   f@rim_free_center_deg  angle of its centre (where one would pour)
+//   i@rim_blocked_sectors  occupied sectors (0-36)
+// POUR PATH: opening_blocked flags any link over the mouth at ANY height. For
+// pouring, only what is close to the mouth matters (up to mouth_window above
+// the rim, 3 cm by default) and on the pouring side (the half of the mouth
+// towards rim_free_center, or its centre): i@pour_path_blocked.
+// =========================================================================
+
+int find_pt(string pat)
+{
+    int n = npoints(0);
+    for (int i = 0; i < n; i++) {
+        string nm = point(0, "name", i);
+        if (match(pat, nm)) return i;
+    }
+    return -1;
+}
+
+int pt_is_handle(int pt)
+{
+    string p = "";
+    if (haspointattrib(1, "part")) p = point(1, "part", pt);
+    if (p == "" && hasprimattrib(1, "part")) {
+        int vtx = pointvertex(1, pt);
+        if (vtx >= 0) p = prim(1, "part", vertexprim(1, vtx));
+    }
+    if (p != "") return (p == "handle");
+    vector c = {1, 1, 1};
+    int vtx = pointvertex(1, pt);
+    if (haspointattrib(1, "Cd")) {
+        c = point(1, "Cd", pt);
+    } else if (vtx >= 0 && hasvertexattrib(1, "Cd")) {
+        c = vertex(1, "Cd", vtx);
+    } else if (vtx >= 0 && hasprimattrib(1, "Cd")) {
+        c = prim(1, "Cd", vertexprim(1, vtx));
+    }
+    return (c.x > 0.6 && c.y < 0.35 && c.z < 0.35);
+}
+
+// zone of the mug surface closest to 'pos'
+string zone_at(vector pos; float ybot; float ytop; float rim_band; float base_band)
+{
+    int pr;
+    vector uv;
+    xyzdist(1, pos, pr, uv);
+    vector sp = primuv(1, "P", pr, uv);
+
+    string part = "";
+    if (hasprimattrib(1, "part")) {
+        part = prim(1, "part", pr);
+    } else if (haspointattrib(1, "part")) {
+        int np = nearpoint(1, sp);
+        part = point(1, "part", np);
+    }
+    int has_cd = haspointattrib(1, "Cd") || hasvertexattrib(1, "Cd") || hasprimattrib(1, "Cd");
+
+    if (part == "handle")   return "handle";
+    if (part == "rim")      return "rim";
+    if (part == "base")     return "base";
+    if (part == "interior") return "interior";   // interior zone
+    if (part == "body")     return "body";       // the label wins over the height rule
+    if (part == "" && has_cd) {
+        vector c = primuv(1, "Cd", pr, uv);
+        if (c.x > 0.6 && c.y < 0.35 && c.z < 0.35) return "handle";
+        if (c.y > 0.6 && c.x < 0.4  && c.z < 0.4)  return "rim";
+    }
+    if (part == "" && !has_cd && sp.y > ytop - rim_band) return "rim";
+    if (sp.y < ybot + base_band) return "base";
+    return "body";
+}
+
+// ---------- parameters (0 = default) ----------
+float c_tol     = chf("contact_tol");   if (c_tol     <= 0) c_tol     = 0.001;  // 1 mm
+float pen_tol   = chf("pen_tol");       if (pen_tol   <= 0) pen_tol   = 0.001;  // 1 mm
+float self_tol  = chf("self_pen_tol");  if (self_tol  <= 0) self_tol  = 0.001;  // 1 mm
+float keep_clr  = chf("keep_clear");    if (keep_clr  <= 0) keep_clr  = 0.01;   // 10 mm (zones)
+float rim_band  = chf("rim_band");      if (rim_band  <= 0) rim_band  = 0.01;
+float base_band = chf("base_band");     if (base_band <= 0) base_band = 0.01;
+int   nsmp      = chi("samples");       if (nsmp      <= 0) nsmp      = 16;
+int   zstride   = chi("zone_stride");   if (zstride   <= 0) zstride   = 4;      // 1 in N points for zones
+int   sstride   = chi("self_stride");   if (sstride   <= 0) sstride   = 20;     // 1 in N for finger-finger collision
+
+int use_mesh = (npoints(3) > 0 && haspointattrib(3, "lp"));
+int has_ok = haspointattrib(3, "prep_ok");
+
+float rad[] = detail(0, "link_radii");
+if (len(rad) != 3) rad = array(0.008, 0.008, 0.008);
+
+// ---------- mug ----------
+vector bmin;
+vector bmax;
+getbbox(1, bmin, bmax);
+float ybot = bmin.y;
+float ytop = bmax.y;
+float ymid = 0.5 * (ybot + ytop);
+float table_y = ybot;
+vector obj_c = getbbox_center(1);
+
+vector bbmin = set( 1e9,  1e9,  1e9);
+vector bbmax = set(-1e9, -1e9, -1e9);
+int has_handle = 0;
+int nmug = npoints(1);
+for (int i = 0; i < nmug; i++) {
+    if (pt_is_handle(i)) {
+        has_handle = 1;
+        continue;
+    }
+    vector p = point(1, "P", i);
+    bbmin = min(bbmin, p);
+    bbmax = max(bbmax, p);
+}
+if (bbmin.x > bbmax.x) {
+    bbmin = bmin;
+    bbmax = bmax;
+}
+vector axis_c = 0.5 * (bbmin + bbmax);
+float r_open = 0.5 * min(bbmax.x - bbmin.x, bbmax.z - bbmin.z);
+
+// ---------- samples of each link (mesh cloud or capsule) ----------
+string fname[] = array("thumb", "ring", "index");
+vector S[];      // sample in world space
+float  SR[];     // radius (0 for the cloud)
+int    SL[];     // link 0..8  (= 3 * finger + link)
+for (int f = 0; f < 3; f++) {
+    int ids[];
+    for (int j = 1; j <= 4; j++) {
+        ids[j - 1] = find_pt(sprintf("*%s*%02d", fname[f], j));
+        if (ids[j - 1] < 0) {
+            error("grasp_contacts: missing %s_%02d", fname[f], j);
+            return;
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        int lid = 3 * f + k;
+        if (use_mesh) {
+            string nk = point(0, "name", ids[k]);
+            vector pk = point(0, "P", ids[k]);
+            matrix3 X = point(0, "transform", ids[k]);
+            for (int i = 0; i < npoints(3); i++) {
+                int okp = 1;
+                if (has_ok) okp = point(3, "prep_ok", i);
+                if (!okp) continue;
+                string jn = point(3, "joint_name", i);
+                if (jn != nk) continue;
+                vector l = point(3, "lp", i);
+                append(S, l * X + pk);
+                append(SR, 0.0);
+                append(SL, lid);
+            }
+        } else {
+            vector pa = point(0, "P", ids[k]);
+            vector pb = point(0, "P", ids[k + 1]);
+            for (int s = 0; s <= nsmp; s++) {
+                append(S, lerp(pa, pb, float(s) / nsmp));
+                append(SR, rad[k]);
+                append(SL, lid);
+            }
+        }
+    }
+}
+int ns = len(S);
+
+// ---------- contacts, penetration, zones, table ----------
+float lmin[];
+vector lpt[];
+for (int l = 0; l < 9; l++) {
+    lmin[l] = 1e9;
+    lpt[l] = 0;
+}
+float pen_depth = 0;
+int near_rim = 0;
+int near_base = 0;
+int near_handle = 0;
+int opening_blocked = 0;
+int table_hit = 0;
+int NB = 36;                 // rim sectors (10 deg each)
+int rim_blk[];
+resize(rim_blk, NB);
+
+for (int i = 0; i < ns; i++) {
+    vector p = S[i];
+    float r = SR[i];
+    float sd = volumesample(2, 0, p);
+    float gap = sd - r;
+    int l = SL[i];
+    if (gap < lmin[l]) {
+        lmin[l] = gap;
+        lpt[l] = p;
+    }
+    if (gap < -pen_tol) pen_depth = max(pen_depth, -gap);
+    if (gap < keep_clr && (i % zstride) == 0) {
+        string z = zone_at(p, ybot, ytop, rim_band, base_band);
+        if (z == "rim") {
+            near_rim = 1;
+            vector dz = p - axis_c;                       // rim sector occupied
+            float az = degrees(atan2(dz.z, dz.x));
+            if (az < 0) az += 360.0;
+            rim_blk[clamp(int(floor(az / (360.0 / NB))), 0, NB - 1)] = 1;
+        }
+        if (z == "base")   near_base = 1;
+        if (z == "handle") near_handle = 1;
+    }
+    vector d = p - axis_c;
+    d.y = 0;
+    if (p.y > ytop - rim_band && length(d) < r_open) opening_blocked = 1;
+    if (p.y - r < table_y - pen_tol) table_hit = 1;
+}
+
+// longest continuous free arc of the rim (circular)
+int best = 0;
+int run = 0;
+int best_end = -1;
+int nblk = 0;
+for (int k = 0; k < NB; k++) nblk += rim_blk[k];
+for (int k = 0; k < 2 * NB; k++) {
+    if (rim_blk[k % NB] == 0) {
+        run++;
+        if (run > best) { best = run; best_end = k; }
+    } else {
+        run = 0;
+    }
+}
+best = min(best, NB);
+float sec = 360.0 / NB;
+float rim_free_arc = best * sec;
+float rim_free_center = -1.0;
+if (best > 0) {
+    rim_free_center = (best_end - 0.5 * (best - 1) + 0.5) * sec;
+    while (rim_free_center >= 360.0) rim_free_center -= 360.0;
+}
+
+// does any link block the pouring path?
+float mouth_h = chf("mouth_window");  if (mouth_h <= 0) mouth_h = 0.03;   // 3 cm above the rim
+int pour_path_blocked = 0;
+if (best == 0) pour_path_blocked = 1;                  // rim without any free sector
+for (int i = 0; i < ns && !pour_path_blocked; i += zstride) {
+    vector p = S[i];
+    if (p.y < ytop - rim_band || p.y > ytop + mouth_h) continue;
+    vector d = p - axis_c;
+    d.y = 0;
+    float rd = length(d);
+    if (rd > r_open + keep_clr) continue;              // outside the mouth
+    if (rd < 0.3 * r_open) { pour_path_blocked = 1; break; }   // over the centre of the mouth
+    float az = degrees(atan2(d.z, d.x));
+    if (az < 0) az += 360.0;
+    float da = abs(az - rim_free_center);
+    if (da > 180.0) da = 360.0 - da;
+    if (da < 90.0) pour_path_blocked = 1;              // in the half of the mouth on the pouring side
+}
+
+vector c_pos[];
+vector c_nrm[];
+string c_zone[];
+string c_chain[];
+int    c_link[];
+float  c_gap[];
+int nc = 0;
+int cnt_f[] = array(0, 0, 0);
+for (int l = 0; l < 9; l++) {
+    if (lmin[l] > c_tol) continue;
+    vector pmin = lpt[l];
+    float smin = volumesample(2, 0, pmin);
+    vector gr = volumegradient(2, 0, pmin);
+    if (length(gr) < 1e-6) gr = normalize(pmin - obj_c);
+    else gr = normalize(gr);
+    vector sp = pmin - gr * smin;                 // point on the surface
+    int f = l / 3;
+    c_pos[nc]   = sp;
+    c_nrm[nc]   = -gr;                            // normal pointing into the object
+    c_zone[nc]  = zone_at(sp, ybot, ytop, rim_band, base_band);
+    c_chain[nc] = fname[f];
+    c_link[nc]  = l % 3;
+    c_gap[nc]   = lmin[l];
+    cnt_f[f] += 1;
+    nc++;
+}
+
+// ---------- finger-finger collision (samples from different fingers) ----------
+float finger_clear = 1e9;
+for (int a = 0; a < ns; a += sstride) {
+    int fa = SL[a] / 3;
+    for (int b = a + 1; b < ns; b += sstride) {
+        if (SL[b] / 3 == fa) continue;
+        finger_clear = min(finger_clear, distance(S[a], S[b]) - SR[a] - SR[b]);
+    }
+}
+// with a cloud (radius 0) the surface distance is >= 0: a collision is flagged
+// when two fingers come closer than self_tol
+int self_col = use_mesh ? (finger_clear < self_tol) : (finger_clear < -self_tol);
+
+// ---------- finger that started inside the mug (from robotiq_close) ----------
+int start_col = 0;
+if (haspointattrib(0, "start_collision")) {
+    for (int i = 0; i < npoints(0); i++) {
+        int sc = point(0, "start_collision", i);
+        start_col = max(start_col, sc);
+    }
+}
+
+// ---------- counts per zone ----------
+int c_handle = 0;
+int c_rim = 0;
+int c_body = 0;
+int c_base = 0;
+int c_interior = 0;
+int c_upper = 0;
+int c_lower = 0;
+for (int i = 0; i < nc; i++) {
+    if (c_zone[i] == "handle") c_handle++;
+    else if (c_zone[i] == "rim") c_rim++;
+    else if (c_zone[i] == "base") c_base++;
+    else if (c_zone[i] == "interior") c_interior++;
+    else c_body++;
+    vector cp = c_pos[i];
+    if (cp.y > ymid) c_upper++;
+    else c_lower++;
+}
+int opposition = (cnt_f[0] > 0) && (cnt_f[1] > 0 || cnt_f[2] > 0);
+
+// ---------- outputs ----------
+v[]@c_pos   = c_pos;
+v[]@c_nrm   = c_nrm;
+s[]@c_zone  = c_zone;
+s[]@c_chain = c_chain;
+i[]@c_link  = c_link;
+f[]@c_gap   = c_gap;
+v@obj_center = obj_c;
+
+i@n_contacts       = nc;
+i@contacts_thumb   = cnt_f[0];
+i@contacts_ring    = cnt_f[1];
+i@contacts_index   = cnt_f[2];
+i@contacts_handle  = c_handle;
+i@contacts_rim     = c_rim;
+i@contacts_body    = c_body;
+i@contacts_base    = c_base;
+i@contacts_interior = c_interior;
+i@contacts_upper   = c_upper;
+i@contacts_lower   = c_lower;
+i@opposition       = opposition;
+f@pen_depth        = pen_depth;
+i@start_collision  = start_col;
+i@self_collision   = self_col;
+f@finger_clearance = finger_clear;
+i@table_hit        = table_hit;
+i@near_rim         = near_rim;
+i@near_base        = near_base;
+i@near_handle      = near_handle;
+i@has_handle       = has_handle;
+i@opening_blocked  = opening_blocked;
+f@rim_free_arc_deg    = rim_free_arc;
+f@rim_free_center_deg = rim_free_center;
+i@rim_blocked_sectors = nblk;
+i@pour_path_blocked   = pour_path_blocked;
+f@mouth_window        = mouth_h;
+f@mug_ybot         = ybot;
+f@mug_ytop         = ytop;
+f@contact_tol      = c_tol;
+f@pen_tol          = pen_tol;
+i@contacts_mesh    = use_mesh;
+i@contacts_samples = ns;
+s@grasp_contacts_version = "v2.3";

@@ -1,0 +1,8 @@
+// =========================================================================
+// handle_label   (Attribute Wrangle)
+// Houdini node: /obj/geo5/ASA_AFFORDANCE      in0 = sweep1 (the handle tube)
+// Labels the handle geometry as "handle" BEFORE the boolean; the Boolean
+// keeps each input's attributes, so part_label finds the label afterwards.
+// =========================================================================
+
+s@affordance_part = "handle";

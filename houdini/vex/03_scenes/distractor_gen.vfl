@@ -1,0 +1,234 @@
+// =========================================================================
+// distractor_gen  v2   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/distractor_gen      in1 = scene_layout
+// Procedural geometry of the scene distractors.
+//
+// Inputs:
+//   in0 = (empty)  -> the output is only the distractor geometry
+//   in1 = scene_layout v1.1 (one point per object)
+// Creates plate, bowl, can, glass, box, bottle, jar, tumbler, vase (open
+// mouth) and pitcher (hollow jug with a handle: a tube along a Bezier) at the
+// position and rotation of each point. MUGS are not built here: they are mugs
+// of the family (see mug_instances).
+// All meshes are CLOSED, resting on y = 0, with UVs (u around, v along the
+// profile; the box: planar UVs per face).
+//
+// Primitive attributes (for the masks and the USD):
+//   i@instance_id, s@class, s@name (obj_02_plate, ...), i@obj_seed
+// Parameters (0 = default): segments (48), flip (0/1: reverses the vertex
+//   order if the normals point inwards), flip_handle (the same for the
+//   pitcher handle)
+// v2: + bottle, jar, tumbler, vase and pitcher; needs scene_layout v1.1
+// =========================================================================
+
+// ---------- closed surface of revolution from a profile ----------
+// rr/yy: profile in the radial plane (r >= 0). An end with r = 0 is closed
+// with a single point on the axis (pole).
+void revolve(float rr[]; float yy[]; int nseg; vector4 q; vector T;
+             int inst; string cls; int seed; int flip)
+{
+    int np = len(rr);
+    int idx[];
+    // cumulative profile length -> v coordinate
+    float vlen[];
+    float acc = 0;
+    for (int i = 0; i < np; i++) {
+        if (i > 0) acc += distance(set(rr[i], yy[i], 0), set(rr[i-1], yy[i-1], 0));
+        append(vlen, acc);
+    }
+    if (acc <= 0) acc = 1;
+    for (int i = 0; i < np; i++) {
+        if (rr[i] < 1e-6) {
+            int p = addpoint(0, qrotate(q, set(0, yy[i], 0)) + T);
+            for (int j = 0; j < nseg; j++) append(idx, p);
+        } else {
+            for (int j = 0; j < nseg; j++) {
+                float a = 2.0 * PI * j / nseg;
+                vector lp = set(rr[i] * cos(a), yy[i], rr[i] * sin(a));
+                append(idx, addpoint(0, qrotate(q, lp) + T));
+            }
+        }
+    }
+    string nm = sprintf("obj_%02d_%s", inst, cls);
+    for (int i = 0; i < np - 1; i++) {
+        for (int j = 0; j < nseg; j++) {
+            int j2 = (j + 1) % nseg;
+            int a = idx[i * nseg + j];
+            int b = idx[i * nseg + j2];
+            int c = idx[(i + 1) * nseg + j2];
+            int d = idx[(i + 1) * nseg + j];
+            int pts[];
+            float us[];
+            float vs[];
+            float u0 = float(j) / nseg;
+            float u1 = float(j + 1) / nseg;
+            float v0 = vlen[i] / acc;
+            float v1 = vlen[i + 1] / acc;
+            if (a == b) {                       // bottom pole: triangle
+                pts = array(a, c, d);  us = array(0.5 * (u0 + u1), u1, u0);  vs = array(v0, v1, v1);
+            } else if (c == d) {                // top pole: triangle
+                pts = array(a, b, c);  us = array(u0, u1, 0.5 * (u0 + u1));  vs = array(v0, v0, v1);
+            } else {
+                pts = array(a, b, c, d);  us = array(u0, u1, u1, u0);  vs = array(v0, v0, v1, v1);
+            }
+            if (flip) { pts = reverse(pts); us = reverse(us); vs = reverse(vs); }
+            int pr = addprim(0, "poly");
+            for (int k = 0; k < len(pts); k++) {
+                int vtx = addvertex(0, pr, pts[k]);
+                setvertexattrib(0, "uv", -1, vtx, set(us[k], vs[k], 0));
+            }
+            setprimattrib(0, "instance_id", pr, inst);
+            setprimattrib(0, "class",       pr, cls);
+            setprimattrib(0, "name",        pr, nm);
+            setprimattrib(0, "obj_seed",    pr, seed);
+        }
+    }
+}
+
+// ---------- closed box (width w in X, height h, depth d in Z) ----------
+void box(float w; float h; float d; vector4 q; vector T; int inst; string cls; int seed; int flip)
+{
+    vector c[] = array(set(-w, 0, -d), set(w, 0, -d), set(w, 0, d), set(-w, 0, d),
+                       set(-w, 2 * h, -d), set(w, 2 * h, -d), set(w, 2 * h, d), set(-w, 2 * h, d));
+    int p[];
+    foreach (vector v; c) append(p, addpoint(0, qrotate(q, 0.5 * v) + T));
+    // faces written counter-clockwise seen from outside; Houdini uses
+    // CLOCKWISE order for outward normals, so they are reversed (below)
+    int faces[] = array(0,1,2,3,  4,7,6,5,  0,4,5,1,  1,5,6,2,  2,6,7,3,  3,7,4,0);
+    string nm = sprintf("obj_%02d_%s", inst, cls);
+    vector uvq[] = array({0,0,0}, {1,0,0}, {1,1,0}, {0,1,0});
+    for (int f = 0; f < 6; f++) {
+        int fp[] = array(p[faces[4*f]], p[faces[4*f+1]], p[faces[4*f+2]], p[faces[4*f+3]]);
+        vector fu[] = uvq;
+        if (!flip) { fp = reverse(fp); fu = reverse(fu); }
+        int pr = addprim(0, "poly");
+        for (int k = 0; k < 4; k++) {
+            int vtx = addvertex(0, pr, fp[k]);
+            setvertexattrib(0, "uv", -1, vtx, fu[k]);
+        }
+        setprimattrib(0, "instance_id", pr, inst);
+        setprimattrib(0, "class",       pr, cls);
+        setprimattrib(0, "name",        pr, nm);
+        setprimattrib(0, "obj_seed",    pr, seed);
+    }
+}
+
+// ---------- tube along a cubic Bezier in the local XY plane ----------
+void tube(vector A; vector B; vector C; vector D; float rad; int nu; int nv;
+          vector4 q; vector T; int inst; string cls; int seed; int flip)
+{
+    vector cs[];
+    for (int i = 0; i <= nu; i++) {
+        float t = float(i) / nu;  float u = 1 - t;
+        append(cs, A*u*u*u + B*3*u*u*t + C*3*u*t*t + D*t*t*t);
+    }
+    vector bz = {0, 0, 1};
+    int idx[];
+    for (int i = 0; i <= nu; i++) {
+        vector tg = (i < nu) ? cs[i+1] - cs[i] : cs[i] - cs[i-1];
+        tg = normalize(tg);
+        vector nn = normalize(cross(bz, tg));
+        for (int j = 0; j < nv; j++) {
+            float a = 2.0 * PI * j / nv;
+            vector lp = cs[i] + rad * (cos(a) * nn + sin(a) * bz);
+            append(idx, addpoint(0, qrotate(q, lp) + T));
+        }
+    }
+    string nm = sprintf("obj_%02d_%s", inst, cls);
+    for (int i = 0; i < nu; i++) {
+        for (int j = 0; j < nv; j++) {
+            int j2 = (j + 1) % nv;
+            int pts[] = array(idx[i*nv + j], idx[i*nv + j2], idx[(i+1)*nv + j2], idx[(i+1)*nv + j]);
+            float us[] = array(float(i)/nu, float(i)/nu, float(i+1)/nu, float(i+1)/nu);
+            float vs[] = array(float(j)/nv, float(j+1)/nv, float(j+1)/nv, float(j)/nv);
+            if (flip) { pts = reverse(pts); us = reverse(us); vs = reverse(vs); }
+            int pr = addprim(0, "poly");
+            for (int k = 0; k < 4; k++) {
+                int vtx = addvertex(0, pr, pts[k]);
+                setvertexattrib(0, "uv", -1, vtx, set(us[k], vs[k], 0));
+            }
+            setprimattrib(0, "instance_id", pr, inst);
+            setprimattrib(0, "class",       pr, cls);
+            setprimattrib(0, "name",        pr, nm);
+            setprimattrib(0, "obj_seed",    pr, seed);
+        }
+    }
+}
+
+int nseg = chi("segments");  if (nseg <= 0) nseg = 48;
+int flip_h = chi("flip_handle");
+int flip = chi("flip");
+
+for (int i = 0; i < npoints(1); i++) {
+    string cls  = point(1, "class", i);
+    if (cls == "mug" || cls == "target_mug") continue;   // mugs are handled separately
+    vector  P    = point(1, "P", i);
+    vector4 q    = point(1, "orient", i);
+    vector  dm   = point(1, "dims", i);
+    int     inst = point(1, "instance_id", i);
+    int     sd   = point(1, "obj_seed", i);
+
+    if (cls == "plate") {                 // plate: foot, sloped rim, 4 mm thick
+        float R = dm.x;  float h = dm.y;  if (h <= 0) h = 0.02;
+        float rr[] = array(0.0,   0.60*R, 0.62*R, 0.95*R, R,  R - 0.004, 0.93*R,        0.62*R, 0.0);
+        float yy[] = array(0.003, 0.003,  0.0,    0.7*h,  h,  h,         0.7*h + 0.004, 0.007,  0.007);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "bowl") {           // bowl: foot and 4 mm curved wall
+        float R = dm.x;  float H = dm.y;
+        float rr[] = array(0.0,   0.42*R, 0.45*R, 0.80*R, R,  R - 0.004, 0.78*R,          0.40*R, 0.0);
+        float yy[] = array(0.004, 0.004,  0.0,    0.45*H, H,  H,         0.45*H + 0.002,  0.008,  0.008);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "can") {            // can: solid, with lips top and bottom
+        float R = dm.x;  float H = dm.y;
+        float rr[] = array(0.0,   0.85*R, 0.95*R, R,     R,         0.95*R, 0.85*R,    0.0);
+        float yy[] = array(0.003, 0.003,  0.0,    0.008, H - 0.008, H,      H - 0.003, H - 0.003);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "glass") {          // glass: 2 mm wall, thick 8 mm bottom
+        float R = dm.x;  float H = dm.y;
+        float rr[] = array(0.0, 0.85*R, R, R - 0.002, 0.85*R - 0.002, 0.0);
+        float yy[] = array(0.0, 0.0,    H, H,         0.008,          0.008);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "box") {
+        box(dm.x, dm.y, dm.z, q, P, inst, cls, sd, flip);
+    } else if (cls == "bottle") {         // solid bottle: body, shoulder, neck, cap
+        float R = dm.x;  float H = dm.y;
+        float sh = fit01(rand(sd + 21), 0.50, 0.70);       // shoulder height
+        float rn = fit01(rand(sd + 22), 0.28, 0.40) * R;   // neck radius
+        float rr[] = array(0.0, 0.92*R, R,     R,      rn,           rn,     1.15*rn, 1.15*rn, 0.0);
+        float yy[] = array(0.0, 0.0,    0.01,  sh*H,   (sh+0.18)*H,  0.90*H, 0.90*H,  H,       H);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "jar") {            // solid jar with a lid
+        float R = dm.x;  float H = dm.y;
+        float rl = 0.90 * R;  float hl = fit01(rand(sd + 21), 0.12, 0.22) * H;
+        float rr[] = array(0.0, 0.95*R, R,     R,          0.88*R,       rl,          rl,  0.0);
+        float yy[] = array(0.0, 0.0,    0.006, H - hl - 0.01, H - hl,    H - hl,      H,   H);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "tumbler") {        // tumbler: slightly conical body and lid
+        float R = dm.x;  float H = dm.y;
+        float rb = fit01(rand(sd + 21), 0.80, 1.0) * R;
+        float rr[] = array(0.0, rb,  R,           1.02*R,      0.96*R, 0.0);
+        float yy[] = array(0.0, 0.0, 0.84*H,      0.86*H,      H,      H);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "vase") {           // hollow vase: belly, neck, open mouth
+        float R = dm.x;  float H = dm.y;  float w = 0.004;
+        float rb = 0.6 * R;  float rn = fit01(rand(sd + 21), 0.35, 0.55) * R;  float rm = rn * 1.25;
+        float yb = fit01(rand(sd + 22), 0.30, 0.45) * H;
+        float rr[] = array(0.0, rb,  R,  rn,     rm, rm - w, rn - w,  R - w,  rb - w, 0.0);
+        float yy[] = array(0.0, 0.0, yb, 0.85*H, H,  H,      0.85*H,  yb,     0.10*H, 0.10*H);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+    } else if (cls == "pitcher") {        // hollow pitcher (3 mm wall) + handle
+        float R = dm.x;  float H = dm.y;  float w = 0.003;
+        float rb = fit01(rand(sd + 21), 0.85, 1.0) * R;
+        float rr[] = array(0.0, rb,  R,  R - w,  rb - w, 0.0);
+        float yy[] = array(0.0, 0.0, H,  H,      0.008,  0.008);
+        revolve(rr, yy, nseg, q, P, inst, cls, sd, flip);
+        // handle on local +X, between 25 % and 85 % of the height
+        float hout = 0.7 * R;  float th = fit01(rand(sd + 23), 0.006, 0.010);
+        vector A  = set(R - 0.002, 0.85 * H, 0);
+        vector D  = set(R - 0.002, 0.25 * H, 0);
+        vector B  = A + set(hout * 1.3, 0.05 * H, 0);
+        vector C  = D + set(hout * 1.3, -0.05 * H, 0);
+        tube(A, B, C, D, th, 24, 12, q, P, inst, cls, sd, flip_h);
+    }
+}
+s@distractor_gen_version = "v2";

@@ -1,0 +1,52 @@
+// =========================================================================
+// semantic_ids  v1.2   (Attribute Wrangle, Run Over: Primitives)
+// Houdini node: /obj/geo5/semantic_ids      in0 = appareace (appearance)
+// Goes AFTER appearance and BEFORE scene_json / the Solaris SOP Import.
+//
+//   i@instance_id  (already set)  0 table, 1 target mug, 2.. distractors, 100 gripper
+//   i@class_id     0 background (no geometry), 1 table, 2 target_mug, 3 mug,
+//                  4 plate, 5 bowl, 6 can, 7 box, 8 glass, 9 gripper,
+//                  10 bottle, 11 jar, 12 tumbler, 13 vase, 14 pitcher
+//   i@part_id      only on mugs (target and distractor mugs), from affordance_part:
+//                  0 not applicable, 1 body, 2 handle, 3 rim, 4 interior, 5 base
+// v@sem_ids = (instance_id, class_id, part_id) as a COLOUR, so the three masks
+// come out of ONE Karma AOV (R, G, B). Background (no geometry) = (0, 0, 0).
+// Since the table also has instance_id 0, the background is told apart by
+// class_id = 0 (G = 0).
+// The code tables are also copied into scene.json.
+// v1.2: classes 10 bottle, 11 jar, 12 tumbler, 13 vase, 14 pitcher
+// =========================================================================
+string cls = s@class;
+int cid = 0;
+if      (cls == "table")      cid = 1;
+else if (cls == "target_mug") cid = 2;
+else if (cls == "mug")        cid = 3;
+else if (cls == "plate")      cid = 4;
+else if (cls == "bowl")       cid = 5;
+else if (cls == "can")        cid = 6;
+else if (cls == "box")        cid = 7;
+else if (cls == "glass")      cid = 8;
+else if (cls == "gripper")    cid = 9;
+else if (cls == "bottle")     cid = 10;
+else if (cls == "jar")        cid = 11;
+else if (cls == "tumbler")    cid = 12;
+else if (cls == "vase")       cid = 13;
+else if (cls == "pitcher")    cid = 14;
+i@class_id = cid;
+
+int pid = 0;
+if (cid == 2 || cid == 3) {
+    string part = "";
+    if (hasprimattrib(0, "affordance_part")) part = s@affordance_part;
+    if (part == "" && hasprimattrib(0, "part")) part = s@part;
+    if      (part == "body")     pid = 1;
+    else if (part == "handle")   pid = 2;
+    else if (part == "rim")      pid = 3;
+    else if (part == "interior") pid = 4;
+    else if (part == "base")     pid = 5;
+}
+i@part_id = pid;
+
+// ---- the three masks in a colour-type vector (integers stored as float) ----
+v@sem_ids = set(float(i@instance_id), float(cid), float(pid));
+setattribtypeinfo(0, "prim", "sem_ids", "color");

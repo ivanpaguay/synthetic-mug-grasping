@@ -1,0 +1,355 @@
+// =========================================================================
+// camera_views  v1.5   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/camera_views
+//
+// The N cameras of one scene, as points (one per view), modelled on a
+// RealSense D435-style colour camera (~69 deg horizontal FOV) with variation;
+// image 1280 x 720 (16:9). The same cameras are used for the "with gripper"
+// and "without gripper" renders, so each view is an exact pair.
+//
+// Inputs:
+//   in0 = (empty)
+//   in1 = target mug (mug_phys.bgeo.sc, in its own frame) -> height, radius, handle
+//   in2 = scene_layout (detail: target_pos, target_orient; points: distractors)
+//   in3 = (optional) gripper already placed in the scene (place_gripper)
+//
+// Parameters (0 = default):
+//   scene_id   -> ch("../scene_layout/scene_id")
+//   view_index -> view used by the Solaris camera (0..n_views-1); in TOPs: @view_id
+//   n_views (4), res_x (1280), res_y (720), haperture_mm (20.955)
+//   hfov_min (60), hfov_max (78)       horizontal field of view (deg)
+//   dist_min (0.35), dist_max (0.90)   distance to the aim point (m)
+//   elev_min (15), elev_max (70)       elevation above the table (deg)
+//   aim_jitter (0.03)                  aim point offset (m)
+//   p_dof (0.3)                        fraction of views with depth of field
+//   frame_margin (1.15)                framing slack (1 = tight)
+//   max_occl (0.25), max_tries (24)    occlusion limit and attempts per view
+//   n_extra (0)                        extra views on the handle side (family E: 0,
+//                                      the E2 experiment: 2)
+//   extra_spread (30), extra_elev_max (45)
+//
+// Framing: the camera aims at the centre of mug + gripper and backs off until
+// that volume fits the frame (vertical FOV, the narrower one in 16:9).
+// Visibility: each view tries up to max_tries candidates and keeps the first
+// one where distractors hide at most max_occl of the target mug (rays from the
+// camera to 7 points on the mug, against the distractors as vertical
+// cylinders); if none passes, the least occluded one.
+//
+// Output (one point per view):
+//   i@view_id, v@P, v@aim, v@rot_euler (deg, XYZ order, for the Camera LOP),
+//   4@xform (camera-to-world), f@hfov_deg, f@focal_mm, f@haperture_mm,
+//   f@vaperture_mm, f@fx, f@fy, f@cx, f@cy (intrinsics in pixels),
+//   f@fstop (0 = no DOF), f@focus_dist, f@cam_dist, f@elev_deg, f@azim_deg,
+//   f@aim_check (1 = camera looks at the aim point), f@fit_dist, f@occl_frac,
+//   i@view_tries, s@view_kind ("handle_front" on extra views)
+// Detail: v@cam_P, v@cam_aim, v@cam_rot, f@cam_focal, f@cam_fstop,
+//   f@cam_focus, f@cam_haperture, f@cam_vaperture (view view_index, for Solaris),
+//   f@frame_radius, v@frame_center, f@handle_az
+// =========================================================================
+
+int   sid   = chi("scene_id");
+int   nv    = chi("n_views");        if (nv <= 0) nv = 4;
+int   vsel  = chi("view_index");
+int   W     = chi("res_x");          if (W <= 0) W = 1280;
+int   H     = chi("res_y");          if (H <= 0) H = 720;
+float hap   = chf("haperture_mm");   if (hap <= 0) hap = 20.955;
+float fmin  = chf("hfov_min");       if (fmin <= 0) fmin = 60.0;
+float fmax  = chf("hfov_max");       if (fmax <= 0) fmax = 78.0;
+float dmin  = chf("dist_min");       if (dmin <= 0) dmin = 0.35;
+float dmax  = chf("dist_max");       if (dmax <= 0) dmax = 0.90;
+float emin  = chf("elev_min");       if (emin <= 0) emin = 15.0;
+float emax  = chf("elev_max");       if (emax <= 0) emax = 70.0;
+float ajit  = chf("aim_jitter");     if (ajit <= 0) ajit = 0.03;
+float pdof  = chf("p_dof");          if (pdof <= 0) pdof = 0.3;
+float fmarg = chf("frame_margin");   if (fmarg <= 0) fmarg = 1.15;
+
+// ---------- what has to fit in the frame ----------
+// target mug: a cylinder of its height and radius (handle included), in the scene
+vector bmn, bmx;
+getbbox(1, bmn, bmx);
+float mug_h = max(0.05, bmx.y - bmn.y);
+float mug_r = max(max(abs(bmn.x), abs(bmx.x)), max(abs(bmn.z), abs(bmx.z)));
+vector tpos = detail(2, "target_pos");
+vector umn = tpos + set(-mug_r, 0.0, -mug_r);
+vector umx = tpos + set( mug_r, mug_h,  mug_r);
+// gripper (in3), if connected
+if (npoints(3) > 0) {
+    vector hmn, hmx;
+    getbbox(3, hmn, hmx);
+    umn = min(umn, hmn);
+    umx = max(umx, hmx);
+}
+vector aim0  = 0.5 * (umn + umx);              // centre of mug + gripper
+float max_occl = chf("max_occl");   if (max_occl <= 0) max_occl = 0.25;
+int   max_tries = chi("max_tries"); if (max_tries <= 0) max_tries = 24;
+
+// ---------- occluders: scene_layout distractors as vertical cylinders ----------
+vector oc_p[];  float oc_r[];  float oc_h[];
+for (int j = 0; j < npoints(2); j++) {
+    int istg = point(2, "is_target", j);           // explicit types: point() is ambiguous
+    if (istg == 1) continue;
+    string cl = point(2, "class", j);
+    vector dm = point(2, "dims", j);
+    vector pj = point(2, "P", j);
+    float  rj = point(2, "radius", j);
+    float hj = dm.y;
+    if (hj <= 0) hj = (cl == "mug") ? 0.13 : 0.10;
+    if (cl == "plate") hj = max(hj, 0.02);
+    append(oc_p, pj);
+    append(oc_r, rj);
+    append(oc_h, hj);
+}
+
+// fraction of rays from cp to points on the target mug that are blocked
+function float occlusion(vector cp; vector tpos; float mug_h; float mug_r;
+                         vector oc_p[]; float oc_r[]; float oc_h[]) {
+    vector side = normalize(cross(set(tpos.x - cp.x, 0, tpos.z - cp.z), {0, 1, 0}));
+    vector tp[] = array(tpos + set(0, 0.25 * mug_h, 0), tpos + set(0, 0.5 * mug_h, 0),
+                        tpos + set(0, 0.85 * mug_h, 0),
+                        tpos + set(0, 0.5 * mug_h, 0) + 0.6 * mug_r * side,
+                        tpos + set(0, 0.5 * mug_h, 0) - 0.6 * mug_r * side,
+                        tpos + set(0, 0.9 * mug_h, 0) + 0.6 * mug_r * side,
+                        tpos + set(0, 0.9 * mug_h, 0) - 0.6 * mug_r * side);
+    int blocked = 0;
+    foreach (vector p; tp) {
+        int hit = 0;
+        for (int j = 0; j < len(oc_p) && !hit; j++) {
+            // segment cp->p in XZ against the occluder's circle
+            float ax = cp.x - oc_p[j].x;  float az = cp.z - oc_p[j].z;
+            float dx = p.x - cp.x;        float dz = p.z - cp.z;
+            float A = dx*dx + dz*dz;
+            float B = 2.0 * (ax*dx + az*dz);
+            float C = ax*ax + az*az - oc_r[j]*oc_r[j];
+            float disc = B*B - 4.0*A*C;
+            if (A <= 1e-9 || disc <= 0) continue;
+            float sq = sqrt(disc);
+            float t1 = max(0.0, (-B - sq) / (2.0*A));
+            float t2 = min(1.0, (-B + sq) / (2.0*A));
+            if (t1 >= t2 || t1 >= 0.999) continue;
+            float y1 = cp.y + t1 * (p.y - cp.y);
+            float y2 = cp.y + t2 * (p.y - cp.y);
+            if (min(y1, y2) <= oc_h[j]) hit = 1;
+        }
+        blocked += hit;
+    }
+    return float(blocked) / float(len(tp));
+}
+float  R_fit = 0.5 * length(umx - umn);        // radius of the enclosing sphere
+float vap = hap * float(H) / float(W);
+
+// ---------- main views: one per azimuth sector ----------
+for (int k = 0; k < nv; k++) {
+  float best_occ = 2.0;
+  int   best_t = 0;
+  for (int pass = 0; pass < 2; pass++) {            // 0: search; 1: build the chosen one
+  for (int t = 0; t < max_tries; t++) {
+    if (pass == 1 && t != best_t) continue;
+    int s = sid * 1009 + k * 97 + 5 + t * 7919;
+    // (explicit float: rand() can also return a vector)
+    float u_az = rand(s + 1);
+    float u_off = rand(sid * 7 + 3);
+    // stratified azimuth: each view in its own 360/nv sector
+    float az   = (k + u_az) * 360.0 / nv + 360.0 * u_off;
+    az = az - 360.0 * floor(az / 360.0);
+    float el   = fit01(rand(s + 2), emin, emax);
+    float hfov = fit01(rand(s + 7), fmin, fmax);
+    // minimum distance for the mug+gripper sphere to fit the vertical FOV, with slack
+    float vfov  = 2.0 * degrees(atan(tan(radians(0.5 * hfov)) * float(H) / float(W)));
+    float d_fit = fmarg * R_fit / sin(radians(0.5 * vfov));
+    float dist = max(fit01(rand(s + 3), dmin, dmax), d_fit);
+    vector aim = aim0 + set(fit01(rand(s + 4), -ajit, ajit),
+                            fit01(rand(s + 5), -0.5 * ajit, 0.5 * ajit),
+                            fit01(rand(s + 6), -ajit, ajit));
+    float ce = cos(radians(el));
+    vector cp = aim + dist * set(ce * cos(radians(az)), sin(radians(el)), ce * sin(radians(az)));
+    if (pass == 0) {
+        float occ = occlusion(cp, tpos, mug_h, mug_r, oc_p, oc_r, oc_h);
+        if (occ < best_occ) { best_occ = occ; best_t = t; }
+        if (occ <= max_occl) break;                 // good enough: stop searching
+        continue;
+    }
+
+    // orientation: the camera's -Z axis looks at 'aim', Y up
+    matrix3 R = lookat(cp, aim, {0, 1, 0});
+    matrix  X = matrix(R);
+    translate(X, cp);
+    vector  eul = cracktransform(0, 0, 1, {0, 0, 0}, X);   // degrees, XYZ order
+    // check: rebuild the camera from the angles only (as the Camera LOP will)
+    // and measure whether its -Z axis points at the aim point:
+    // aim_check = 1 -> correct; -1 -> looking backwards; other -> wrong angles
+    matrix  Xr  = maketransform(0, 0, cp, eul, {1, 1, 1});
+    vector  fwd = normalize({0, 0, -1} * matrix3(Xr));
+    float   aim_check = dot(fwd, normalize(aim - cp));
+
+    float focal = 0.5 * hap / tan(radians(0.5 * hfov));
+    float fx    = 0.5 * W / tan(radians(0.5 * hfov));
+    float fy    = fx;                                       // square pixels
+    float fst   = 0.0;
+    float fdist = length(aim - cp);
+    float u_dof = rand(s + 8);
+    if (u_dof < pdof) {
+        fst   = fit01(rand(s + 9), 2.0, 8.0);
+        fdist = fdist * fit01(rand(s + 10), 0.95, 1.05);   // focus close to the mug
+    }
+
+    int pt = addpoint(0, cp);
+    setpointattrib(0, "view_id",      pt, k);
+    setpointattrib(0, "aim",          pt, aim);
+    setpointattrib(0, "rot_euler",    pt, eul);
+    setpointattrib(0, "xform",        pt, X);
+    setpointattrib(0, "hfov_deg",     pt, hfov);
+    setpointattrib(0, "focal_mm",     pt, focal);
+    setpointattrib(0, "haperture_mm", pt, hap);
+    setpointattrib(0, "vaperture_mm", pt, vap);
+    setpointattrib(0, "fx", pt, fx);
+    setpointattrib(0, "fy", pt, fy);
+    setpointattrib(0, "cx", pt, 0.5 * W);
+    setpointattrib(0, "cy", pt, 0.5 * H);
+    setpointattrib(0, "fstop",        pt, fst);
+    setpointattrib(0, "focus_dist",   pt, fdist);
+    setpointattrib(0, "cam_dist",     pt, dist);
+    setpointattrib(0, "elev_deg",     pt, el);
+    setpointattrib(0, "azim_deg",     pt, az);
+    setpointattrib(0, "aim_check",    pt, aim_check);
+    setpointattrib(0, "fit_dist",     pt, d_fit);
+    setpointattrib(0, "occl_frac",    pt, best_occ);
+    setpointattrib(0, "view_tries",   pt, best_t + 1);
+
+    if (k == vsel) {
+        v@cam_P          = cp;
+        v@cam_aim        = aim;                 // for a /obj camera with Look At
+        v@cam_rot        = eul;
+        f@cam_focal      = focal;
+        f@cam_fstop      = fst;
+        f@cam_focus      = fdist;
+        f@cam_haperture  = hap;
+        f@cam_vaperture  = vap;
+        f@cam_aim_check  = aim_check;
+        f@cam_occl_frac  = best_occ;
+    }
+  }
+  }
+}
+f@frame_radius = R_fit;
+v@frame_center = aim0;
+
+// ---------- extra views on the handle side (E2 experiment; 0 in family E) ----------
+// Added to test whether the low share of frontal handles in synthetic data (20 %
+// vs 46 % in real photos) explained the handle gap. It did not (see the report).
+// Views 0..nv-1 are unchanged; extra views get view_id nv, nv+1, ...
+int   x_n      = chi("n_extra");
+float x_spread = chf("extra_spread");    if (x_spread <= 0) x_spread = 30.0;
+float x_emax   = chf("extra_elev_max");  if (x_emax <= 0) x_emax = 45.0;
+
+// handle direction in world space
+vector x_hc = {0, 0, 0};
+int    x_hn = 0;
+for (int pr = 0; pr < nprimitives(1); pr++) {
+    string ap = "";
+    if (hasprimattrib(1, "affordance_part")) ap = prim(1, "affordance_part", pr);
+    if (ap == "" && hasprimattrib(1, "part")) ap = prim(1, "part", pr);
+    if (ap != "handle") continue;
+    vector c = primuv(1, "P", pr, {0.5, 0.5});
+    x_hc += c;
+    x_hn++;
+}
+vector  x_dl = (x_hn > 0) ? normalize(set(x_hc.x / x_hn, 0.0, x_hc.z / x_hn)) : set(1.0, 0.0, 0.0);
+vector4 x_q  = detail(2, "target_orient");
+vector  x_dw = qrotate(x_q, x_dl);
+float   x_haz = degrees(atan2(x_dw.z, x_dw.x));
+f@handle_az = x_haz;
+if (x_n > 0 && x_hn == 0) warning("camera_views: the target mug (input 1) has no 'handle' primitives");
+
+for (int k = nv; k < nv + x_n; k++) {
+    float best_occ = 2.0;
+    int   best_t = 0;
+    for (int pass = 0; pass < 2; pass++) {
+    for (int t = 0; t < max_tries; t++) {
+        if (pass == 1 && t != best_t) continue;
+        int s = sid * 1009 + k * 97 + 5 + t * 7919 + 333;
+        float u_a = rand(s + 1);
+        float u_e = rand(s + 2);
+        float u_d = rand(s + 3);
+        // first attempts close to the handle; widen the fan if occluded
+        float spread = x_spread * (1.0 + 0.5 * floor(t / 6.0));
+        float az = x_haz + fit01(u_a, -spread, spread);
+        float el = fit01(u_e, 15.0, x_emax);
+        float hfov_r = rand(s + 7);
+        float hfov = fit01(hfov_r, fmin, fmax);
+        float vfov = 2.0 * degrees(atan(tan(radians(0.5 * hfov)) * float(H) / float(W)));
+        float d_fit = fmarg * R_fit / sin(radians(0.5 * vfov));
+        float dist = max(fit01(u_d, dmin, dmax), d_fit);
+        float j1 = rand(s + 4);
+        float j2 = rand(s + 5);
+        float j3 = rand(s + 6);
+        vector aim = aim0 + set(fit01(j1, -ajit, ajit), fit01(j2, -0.5 * ajit, 0.5 * ajit), fit01(j3, -ajit, ajit));
+        float ce = cos(radians(el));
+        vector cp = aim + dist * set(ce * cos(radians(az)), sin(radians(el)), ce * sin(radians(az)));
+        if (pass == 0) {
+            float occ = occlusion(cp, tpos, mug_h, mug_r, oc_p, oc_r, oc_h);
+            if (occ < best_occ) { best_occ = occ; best_t = t; }
+            if (occ <= max_occl) break;
+            continue;
+        }
+        matrix3 R = lookat(cp, aim, {0, 1, 0});
+        matrix  X = matrix(R);
+        translate(X, cp);
+        vector  eul = cracktransform(0, 0, 1, {0, 0, 0}, X);
+        matrix  Xr  = maketransform(0, 0, cp, eul, {1, 1, 1});
+        vector  fwd = normalize({0, 0, -1} * matrix3(Xr));
+        float   aim_check = dot(fwd, normalize(aim - cp));
+        float focal = 0.5 * hap / tan(radians(0.5 * hfov));
+        float fx = 0.5 * W / tan(radians(0.5 * hfov));
+        float fst = 0.0;
+        float fdist = length(aim - cp);
+        float u_dof = rand(s + 8);
+        if (u_dof < pdof) {
+            float u_f = rand(s + 9);
+            float u_g = rand(s + 10);
+            fst = fit01(u_f, 2.0, 8.0);
+            fdist = fdist * fit01(u_g, 0.95, 1.05);
+        }
+        float azn = az - 360.0 * floor(az / 360.0);
+        int pt = addpoint(0, cp);
+        setpointattrib(0, "view_id",      pt, k);
+        setpointattrib(0, "aim",          pt, aim);
+        setpointattrib(0, "rot_euler",    pt, eul);
+        setpointattrib(0, "xform",        pt, X);
+        setpointattrib(0, "hfov_deg",     pt, hfov);
+        setpointattrib(0, "focal_mm",     pt, focal);
+        setpointattrib(0, "haperture_mm", pt, hap);
+        setpointattrib(0, "vaperture_mm", pt, vap);
+        setpointattrib(0, "fx", pt, fx);
+        setpointattrib(0, "fy", pt, fx);
+        setpointattrib(0, "cx", pt, 0.5 * W);
+        setpointattrib(0, "cy", pt, 0.5 * H);
+        setpointattrib(0, "fstop",        pt, fst);
+        setpointattrib(0, "focus_dist",   pt, fdist);
+        setpointattrib(0, "cam_dist",     pt, dist);
+        setpointattrib(0, "elev_deg",     pt, el);
+        setpointattrib(0, "azim_deg",     pt, azn);
+        setpointattrib(0, "aim_check",    pt, aim_check);
+        setpointattrib(0, "fit_dist",     pt, d_fit);
+        setpointattrib(0, "occl_frac",    pt, best_occ);
+        setpointattrib(0, "view_tries",   pt, best_t + 1);
+        setpointattrib(0, "view_kind",    pt, "handle_front");
+        if (k == vsel) {
+            v@cam_P          = cp;
+            v@cam_aim        = aim;
+            v@cam_rot        = eul;
+            f@cam_focal      = focal;
+            f@cam_fstop      = fst;
+            f@cam_focus      = fdist;
+            f@cam_haperture  = hap;
+            f@cam_vaperture  = vap;
+            f@cam_aim_check  = aim_check;
+            f@cam_occl_frac  = best_occ;
+        }
+    }
+    }
+}
+i@n_views    = nv + x_n;
+i@res_x      = W;
+i@res_y      = H;
+i@view_index = vsel;
+s@camera_views_version = "v1.5";

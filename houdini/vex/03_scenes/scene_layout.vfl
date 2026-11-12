@@ -1,0 +1,222 @@
+// =========================================================================
+// scene_layout  v1.1   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/scene_layout      in1 = file3, in2 = mesh_rigid_deform
+// Table layout. Creates ONE POINT PER OBJECT of the scene (the geometry is
+// placed afterwards, e.g. with Copy to Points).
+//
+// Inputs:
+//   in0 = (empty)  -> the output is only the layout points
+//   in1 = target mug (mug_phys.bgeo.sc, in its own frame: axis at the origin,
+//         base at y = 0). Gives the mug footprint (handle included).
+//   in2 = (optional) the hand of the chosen grasp, in the SAME frame as the
+//         mug (grasp geometry sample_XXXXXXX.bgeo.sc). If connected,
+//         distractors are not placed under the hand footprint.
+//
+// Table: plane y = 0, centred at the origin, table_w (X) x table_d (Z).
+// The target mug is placed near the centre with a random rotation; the hand
+// (in2) rotates and moves with it.
+//
+// Output (points):
+//   s@class        target_mug | mug | plate | bowl | can | box | glass |
+//                  bottle | jar | tumbler | vase | pitcher
+//   i@is_target    1 only on the target mug
+//   i@instance_id  1 = target mug, 2.. = distractors (instance mask)
+//   p@orient       rotation about Y (quaternion)
+//   f@yaw          the same rotation in degrees
+//   f@radius       footprint radius on the table (m)
+//   f@pscale       = radius (to see the footprints with Copy to Points + Circle)
+//   v@dims         measurements for the distractor generators:
+//                  round objects: (radius, height, 0); box: (width, height, depth)
+//   i@ref_mug_id   on "mug" distractors: which mug of the family to use
+//   i@obj_seed     each object's own seed (materials, details)
+// Detail: scene_id, target_mug_id, target_pos, target_yaw, target_orient,
+//   n_distractors, n_requested, layout_rejected, hand_points_used, table_w/d
+//
+// Parameters (0 = default):
+//   scene_id, seed, target_mug_id, mug_count (mugs in the family, 20),
+//   table_w (1.2), table_d (0.8), gap (0.01), hand_margin (0.04),
+//   n_min (3), n_max (8), target_range_x (0.20), target_range_z (0.12),
+//   mug_id_base (0; family E = 100; mug distractors = mug_id_base ..
+//   mug_id_base + mug_count - 1)
+// v1.1: + distractors bottle, jar, tumbler, vase, pitcher (jug with a handle);
+//       more objects per scene (3-8 by default); mug_id_base
+// =========================================================================
+
+int   scene_id   = chi("scene_id");
+int   seed0      = scene_id * 101 + chi("seed") * 7919;
+int   target_mug = chi("target_mug_id");
+int   mug_count  = chi("mug_count");        if (mug_count <= 0) mug_count = 20;
+float table_w    = chf("table_w");          if (table_w <= 0) table_w = 1.2;
+float table_d    = chf("table_d");          if (table_d <= 0) table_d = 0.8;
+float gap        = chf("gap");              if (gap <= 0) gap = 0.01;
+float hand_mrg   = chf("hand_margin");      if (hand_mrg <= 0) hand_mrg = 0.04;
+int   n_min      = chi("n_min");
+int   n_max      = chi("n_max");            if (n_max <= 0) { n_min = 3; n_max = 8; }
+int   mug_base   = chi("mug_id_base");
+float rng_x      = chf("target_range_x");   if (rng_x <= 0) rng_x = 0.20;
+float rng_z      = chf("target_range_z");   if (rng_z <= 0) rng_z = 0.12;
+
+// ---------- footprint of the target mug (in1) ----------
+float r_t = 0.0;
+for (int i = 0; i < npoints(1); i++) {
+    vector p = point(1, "P", i);
+    r_t = max(r_t, length(set(p.x, 0.0, p.z)));
+}
+if (r_t <= 0.0) r_t = 0.08;
+
+// ---------- pose of the target mug ----------
+float  t_yaw = fit01(rand(seed0 + 1), 0.0, 360.0);
+vector t_pos = set(fit01(rand(seed0 + 2), -rng_x, rng_x), 0.0,
+                   fit01(rand(seed0 + 3), -rng_z, rng_z));
+vector4 t_q  = quaternion(radians(t_yaw), {0, 1, 0});
+
+// ---------- hand footprint (in2, optional), already placed with the mug ----------
+float hx[];
+float hz[];
+int nh = npoints(2);
+int hstride = max(1, nh / 3000);
+for (int i = 0; i < nh; i += hstride) {
+    vector p = qrotate(t_q, point(2, "P", i)) + t_pos;
+    append(hx, p.x);
+    append(hz, p.z);
+}
+
+// ---------- objects already placed (to avoid overlaps) ----------
+float px[];
+float pz[];
+float pr[];
+append(px, t_pos.x);
+append(pz, t_pos.z);
+append(pr, r_t);
+
+int pt = addpoint(0, t_pos);
+setpointattrib(0, "class",       pt, "target_mug");
+setpointattrib(0, "is_target",   pt, 1);
+setpointattrib(0, "instance_id", pt, 1);
+setpointattrib(0, "orient",      pt, t_q);
+setpointattrib(0, "yaw",         pt, t_yaw);
+setpointattrib(0, "radius",      pt, r_t);
+setpointattrib(0, "pscale",      pt, r_t);
+setpointattrib(0, "dims",        pt, set(r_t, 0.0, 0.0));
+setpointattrib(0, "ref_mug_id",  pt, target_mug);
+setpointattrib(0, "obj_seed",    pt, seed0);
+
+// ---------- distractors ----------
+// v1.1: weights (more distractor mugs and confusing cylinders)
+string classes[] = {"mug", "mug", "plate", "bowl", "can", "box", "glass",
+                    "bottle", "bottle", "jar", "tumbler", "tumbler", "vase", "pitcher", "pitcher"};
+int n_req = n_min + int(floor(rand(seed0 + 4) * (n_max - n_min + 1)));
+int placed = 0;
+int rejected = 0;
+int next_id = 2;
+
+for (int k = 0; k < n_req; k++) {
+    int    s   = seed0 + 1000 * (k + 1);
+    string cls = classes[min(len(classes) - 1, int(floor(rand(s + 1) * len(classes))))];
+
+    // measurements per class (m) and footprint radius
+    vector dims = 0;
+    float  r = 0.05;
+    int    ref = -1;
+    if (cls == "mug") {
+        int k_m = min(mug_count - 1, int(floor(rand(s + 2) * mug_count)));
+        ref = mug_base + k_m;
+        if (ref == target_mug) ref = mug_base + (k_m + 1) % mug_count;
+        r = 0.085;                                  // conservative: body + handle
+        dims = set(r, 0.0, 0.0);
+    } else if (cls == "plate") {
+        float pr_ = fit01(rand(s + 2), 0.09, 0.13);
+        dims = set(pr_, 0.02, 0.0);
+        r = pr_;
+    } else if (cls == "bowl") {
+        float br = fit01(rand(s + 2), 0.06, 0.09);
+        dims = set(br, fit01(rand(s + 3), 0.04, 0.07), 0.0);
+        r = br;
+    } else if (cls == "can") {
+        dims = set(0.033, fit01(rand(s + 3), 0.10, 0.12), 0.0);
+        r = 0.034;
+    } else if (cls == "box") {
+        float bw = fit01(rand(s + 2), 0.05, 0.15);
+        float bd = fit01(rand(s + 3), 0.05, 0.12);
+        dims = set(bw, fit01(rand(s + 4), 0.03, 0.12), bd);
+        r = 0.5 * sqrt(bw * bw + bd * bd);
+    } else if (cls == "bottle") {                   // bottle: radius, height
+        float br = fit01(rand(s + 2), 0.028, 0.045);
+        dims = set(br, fit01(rand(s + 3), 0.18, 0.30), 0.0);
+        r = br;
+    } else if (cls == "jar") {                      // jar with a lid
+        float jr = fit01(rand(s + 2), 0.035, 0.060);
+        dims = set(jr, fit01(rand(s + 3), 0.07, 0.16), 0.0);
+        r = jr;
+    } else if (cls == "tumbler") {                  // insulated / travel tumbler
+        float tr = fit01(rand(s + 2), 0.032, 0.045);
+        dims = set(tr, fit01(rand(s + 3), 0.14, 0.24), 0.0);
+        r = tr;
+    } else if (cls == "vase") {                     // vase
+        float vr = fit01(rand(s + 2), 0.040, 0.070);
+        dims = set(vr, fit01(rand(s + 3), 0.12, 0.25), 0.0);
+        r = vr;
+    } else if (cls == "pitcher") {                  // jug with a handle: radius, height
+        float pr2 = fit01(rand(s + 2), 0.045, 0.065);
+        dims = set(pr2, fit01(rand(s + 3), 0.14, 0.22), 0.0);
+        r = pr2 + 0.7 * pr2 + 0.01;                 // body + handle
+    } else {                                        // glass
+        float gr = fit01(rand(s + 2), 0.030, 0.040);
+        dims = set(gr, fit01(rand(s + 3), 0.09, 0.14), 0.0);
+        r = gr;
+    }
+
+    // search for a free spot (rejection sampling)
+    int ok = 0;
+    vector c = 0;
+    for (int t = 0; t < 80 && !ok; t++) {
+        c = set(fit01(rand(s + 10 + 2 * t), -0.5 * table_w + r, 0.5 * table_w - r), 0.0,
+                fit01(rand(s + 11 + 2 * t), -0.5 * table_d + r, 0.5 * table_d - r));
+        ok = 1;
+        for (int j = 0; j < len(px) && ok; j++) {
+            float dx = c.x - px[j];
+            float dz = c.z - pz[j];
+            if (sqrt(dx * dx + dz * dz) < r + pr[j] + gap) ok = 0;
+        }
+        for (int j = 0; j < len(hx) && ok; j++) {
+            float dx = c.x - hx[j];
+            float dz = c.z - hz[j];
+            if (sqrt(dx * dx + dz * dz) < r + hand_mrg) ok = 0;
+        }
+    }
+    if (!ok) { rejected++; continue; }
+
+    float   yaw = fit01(rand(s + 5), 0.0, 360.0);
+    vector4 q   = quaternion(radians(yaw), {0, 1, 0});
+    int p2 = addpoint(0, c);
+    setpointattrib(0, "class",       p2, cls);
+    setpointattrib(0, "is_target",   p2, 0);
+    setpointattrib(0, "instance_id", p2, next_id);
+    setpointattrib(0, "orient",      p2, q);
+    setpointattrib(0, "yaw",         p2, yaw);
+    setpointattrib(0, "radius",      p2, r);
+    setpointattrib(0, "pscale",      p2, r);
+    setpointattrib(0, "dims",        p2, dims);
+    setpointattrib(0, "ref_mug_id",  p2, ref);
+    setpointattrib(0, "obj_seed",    p2, s);
+    append(px, c.x);
+    append(pz, c.z);
+    append(pr, r);
+    next_id++;
+    placed++;
+}
+
+// ---------- detail ----------
+i@scene_id          = scene_id;
+i@target_mug_id     = target_mug;
+v@target_pos        = t_pos;
+f@target_yaw        = t_yaw;
+p@target_orient     = t_q;
+i@n_distractors     = placed;
+i@n_requested       = n_req;
+i@layout_rejected   = rejected;
+i@hand_points_used  = len(hx);
+f@table_w           = table_w;
+f@table_d           = table_d;
+i@mug_id_base       = mug_base;
+s@layout_version    = "v1.1";

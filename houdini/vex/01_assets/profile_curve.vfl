@@ -1,0 +1,87 @@
+// =========================================================================
+// profile_curve  v2   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/PERFIL      in0 = line1
+// Parametric lathe profile of the mug body: r(v) with v = y / h,
+//   r = lerp(r_base, r_top, v^flare) + bulge * sin(pi v)
+// The same radiusAt() is used by handle_generator and wall_probe, so the
+// handle stays attached to the wall.
+// - The PARAMETER wins (the @glass_* expression of the work item); the
+//   geometry attribute is used only if the parameter is 0 (same rule as
+//   handle_generator).
+// - Optional FOOT (tea / espresso cups): glass_foot_h (height) and
+//   glass_foot_r (radius). With foot_h = 0 there is no foot. Above the foot
+//   the body keeps the same formula r(v).
+// - Writes profile_style_used and the measurements used (they go to mug.json).
+// Parameters (create them with the parameter button): glass_h, glass_r_base,
+//   glass_r_top, glass_bulge, glass_flare, glass_foot_h, glass_foot_r,
+//   profile_style, samples
+//   -> expressions:  @glass_h ... @glass_foot_h   @glass_foot_r   @profile_style
+// Note: the attribute name perfil_version ("perfil" = profile) is kept as in
+// the released data.
+// =========================================================================
+
+float a_h  = isbound("@glass_h")      ? @glass_h      : 0.0;
+float a_rb = isbound("@glass_r_base") ? @glass_r_base : 0.0;
+float a_rt = isbound("@glass_r_top")  ? @glass_r_top  : 0.0;
+float a_bu = isbound("@glass_bulge")  ? @glass_bulge  : 0.0;
+float a_fl = isbound("@glass_flare")  ? @glass_flare  : 0.0;
+
+float h         = chf("glass_h");       if (h == 0.0)         h = a_h;
+float r_base    = chf("glass_r_base");  if (r_base == 0.0)    r_base = a_rb;
+float r_top     = chf("glass_r_top");   if (r_top == 0.0)     r_top = a_rt;
+float bulge_amp = chf("glass_bulge");   if (bulge_amp == 0.0) bulge_amp = a_bu;
+float flare_exp = chf("glass_flare");   if (flare_exp == 0.0) flare_exp = a_fl;
+float foot_h    = chf("glass_foot_h");
+float foot_r    = chf("glass_foot_r");
+int   pstyle    = chi("profile_style");
+int   samples   = chi("samples");
+
+if (h <= 0.0)         h = 0.12;
+if (r_base <= 0.0)    r_base = 0.030;
+if (r_top <= 0.0)     r_top = 0.040;
+if (flare_exp <= 0.0) flare_exp = 1.0;
+if (samples <= 0)     samples = 32;
+foot_h = clamp(foot_h, 0.0, 0.25 * h);
+if (foot_r <= 0.0)    foot_r = r_base;
+
+function float radiusAt(float v; float r_base; float r_top; float flare_exp; float bulge_amp) {
+    float px = lerp(r_base, r_top, pow(v, flare_exp));
+    px += sin(v * PI) * bulge_amp;
+    return max(px, 0.005);
+}
+
+// centre point of the bottom
+int prim = addprim(0, "polyline");
+addvertex(0, prim, addpoint(0, set(0.0, 0.0, 0.0)));
+
+float v0 = 0.0;
+if (foot_h > 0.0) {
+    // foot: straight ring of radius foot_r and height foot_h; on top, a small
+    // step towards the body (like the foot of a tea cup)
+    addvertex(0, prim, addpoint(0, set(foot_r, 0.0, 0.0)));
+    addvertex(0, prim, addpoint(0, set(foot_r, 0.85 * foot_h, 0.0)));
+    float r_join = radiusAt(foot_h / h, r_base, r_top, flare_exp, bulge_amp);
+    addvertex(0, prim, addpoint(0, set(lerp(foot_r, r_join, 0.5), foot_h, 0.0)));
+    v0 = foot_h / h;
+}
+
+// body: from the foot (or the base) up to the mouth, same formula
+for (int i = 0; i <= samples; i++) {
+    float v  = lerp(v0, 1.0, float(i) / float(samples));
+    if (foot_h > 0.0 && i == 0) continue;               // already joined to the foot
+    float py = v * h;
+    float px = radiusAt(v, r_base, r_top, flare_exp, bulge_amp);
+    addvertex(0, prim, addpoint(0, set(px, py, 0.0)));
+}
+
+// metrics + measurements used
+f@glass_height       = h;
+f@glass_r_base       = r_base;
+f@glass_r_top        = r_top;
+f@glass_grasp_radius = lerp(r_base, r_top, pow(0.5, flare_exp)) + (sin(0.5 * PI) * bulge_amp);
+f@glass_foot_h_used  = foot_h;
+f@glass_foot_r_used  = (foot_h > 0.0) ? foot_r : 0.0;
+f@glass_flare_used   = flare_exp;
+f@glass_bulge_used   = bulge_amp;
+i@profile_style_used = pstyle;
+s@perfil_version     = "v2";

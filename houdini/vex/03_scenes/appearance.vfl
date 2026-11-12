@@ -1,0 +1,112 @@
+// =========================================================================
+// appearance  v1.1   (Attribute Wrangle, Run Over: Primitives)
+// Houdini node: /obj/geo5/appareace      in0 = visualize1
+// Material parameters per OBJECT (all primitives of the same instance_id get
+// the same values). The universal MaterialX material in Solaris reads them as
+// primvars.
+//
+// in0 = full scene (unpacked mugs + distractors + gripper + table)
+//       with i@instance_id and s@class on the primitives
+// Parameters:
+//   scene_id     -> ch("../scene_layout/scene_id")
+//   scene_style  0 = realistic (believable palettes per class)
+//                1 = randomized (domain randomization)
+// Output (primitive):
+//   v@Cd          base colour (exported to USD as displayColor)
+//   f@roughness, f@metalness, f@transmission (0-1)
+//   s@mat_type    ceramic | glass | metal | cardboard | wood | plastic | gripper | random
+//   i@scene_style
+// v1.1: palettes for bottle, jar, tumbler, vase, pitcher
+// =========================================================================
+
+int  scene_id = chi("scene_id");
+int  style    = chi("scene_style");
+int  inst     = i@instance_id;
+string cls    = s@class;
+int  s        = scene_id * 1000 + inst * 17 + 3;
+
+vector col = {0.8, 0.8, 0.8};
+float rough = 0.4;
+float metal = 0.0;
+float trans = 0.0;
+string mt = "ceramic";
+
+// ceramic palette: white, cream, black, grey, blue, red, green, mustard, pastels
+vector ceramic[] = array({0.92,0.92,0.90}, {0.93,0.88,0.78}, {0.06,0.06,0.07},
+                         {0.45,0.46,0.48}, {0.12,0.25,0.55}, {0.60,0.10,0.10},
+                         {0.20,0.42,0.30}, {0.80,0.60,0.15}, {0.75,0.80,0.90},
+                         {0.90,0.75,0.75});
+
+if (cls == "gripper") {                       // the gripper: always the same (aluminium / black)
+    col = {0.35, 0.36, 0.38};  rough = 0.35;  metal = 0.8;  mt = "gripper";
+} else if (cls == "table") {
+    if (style == 0) {                         // wood / laminate
+        vector woods[] = array({0.45,0.30,0.18}, {0.62,0.46,0.30}, {0.30,0.20,0.12},
+                               {0.80,0.78,0.74}, {0.20,0.20,0.21});
+        col = woods[int(floor(rand(s + 1) * len(woods)))];
+        rough = fit01(rand(s + 2), 0.35, 0.75);  mt = "wood";
+    }
+} else if (style == 0) {
+    float u_mat = rand(s + 5);                // explicit float (rand can also return a vector)
+    if (cls == "glass") {
+        float tg = rand(s + 1);                   // explicit float: rand() can also return a vector
+        col = lerp({0.95,0.97,0.97}, {0.80,0.90,0.85}, tg);
+        rough = fit01(rand(s + 2), 0.0, 0.05);  trans = 1.0;  mt = "glass";
+    } else if (cls == "can") {
+        vector cans[] = array({0.70,0.05,0.05}, {0.05,0.20,0.55}, {0.75,0.75,0.78},
+                              {0.10,0.45,0.15}, {0.90,0.75,0.10}, {0.08,0.08,0.08});
+        col = cans[int(floor(rand(s + 1) * len(cans)))];
+        rough = fit01(rand(s + 2), 0.15, 0.35);  metal = 0.7;  mt = "metal";
+    } else if (cls == "box") {
+        float tb = rand(s + 1);
+        col = lerp({0.55,0.40,0.25}, {0.75,0.62,0.45}, tb);
+        rough = fit01(rand(s + 2), 0.7, 0.95);  mt = "cardboard";
+    } else if (cls == "bottle" || cls == "jar") {
+        float p_glass = (cls == "jar") ? 0.7 : 0.4;
+        if (u_mat < p_glass) {                  // glass: clear, green or amber
+            vector tints[] = array({0.95,0.97,0.97}, {0.55,0.80,0.55}, {0.75,0.50,0.25});
+            col = tints[int(floor(rand(s + 1) * len(tints)))];
+            rough = fit01(rand(s + 2), 0.0, 0.05);  trans = 1.0;  mt = "glass";
+        } else {                              // coloured plastic
+            float hue = rand(s + 1);
+            float sat = rand(s + 3);
+            float val = rand(s + 4);
+            col = hsvtorgb(set(hue, fit01(sat, 0.3, 0.9), fit01(val, 0.4, 0.95)));
+            rough = fit01(rand(s + 2), 0.2, 0.5);  mt = "plastic";
+        }
+    } else if (cls == "tumbler") {
+        if (u_mat < 0.5) {                    // steel
+            vector steels[] = array({0.75,0.75,0.77}, {0.12,0.12,0.13}, {0.55,0.70,0.80}, {0.85,0.65,0.70});
+            col = steels[int(floor(rand(s + 1) * len(steels)))];
+            rough = fit01(rand(s + 2), 0.15, 0.40);  metal = 0.9;  mt = "metal";
+        } else {
+            float hue = rand(s + 1);
+            float sat = rand(s + 3);
+            float val = rand(s + 4);
+            col = hsvtorgb(set(hue, fit01(sat, 0.2, 0.8), fit01(val, 0.3, 0.95)));
+            rough = fit01(rand(s + 2), 0.3, 0.6);  mt = "plastic";
+        }
+    } else if ((cls == "vase" || cls == "pitcher") && u_mat < 0.35) {
+        float tg = rand(s + 1);               // glass vase / pitcher
+        col = lerp({0.95,0.97,0.97}, {0.80,0.90,0.85}, tg);
+        rough = fit01(rand(s + 2), 0.0, 0.05);  trans = 1.0;  mt = "glass";
+    } else {                                  // mugs, plates, bowls, vases, pitchers: ceramic
+        col = ceramic[int(floor(rand(s + 1) * len(ceramic)))];
+        rough = fit01(rand(s + 2), 0.08, 0.45);  mt = "ceramic";
+    }
+}
+
+if (style == 1 && cls != "gripper") {         // randomized: everything random
+    col   = hsvtorgb(set(rand(s + 11), fit01(rand(s + 12), 0.0, 1.0), fit01(rand(s + 13), 0.05, 1.0)));
+    rough = rand(s + 14);
+    metal = (rand(s + 15) < 0.2) ? 1.0 : 0.0;
+    trans = (cls != "table" && rand(s + 16) < 0.1) ? 1.0 : 0.0;
+    mt = "random";
+}
+
+v@Cd = col;
+f@roughness = rough;
+f@metalness = metal;
+f@transmission = trans;
+s@mat_type = mt;
+i@scene_style = style;

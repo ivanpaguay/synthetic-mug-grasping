@@ -1,0 +1,253 @@
+// =========================================================================
+// handle_generator  v5.11   (Attribute Wrangle, Run Over: Detail)
+// Houdini node: /obj/geo5/ASA1      no inputs (draws the handle path)
+//
+// Procedural mug handle: one open polyline, later swept into a tube.
+// It follows the same lathe profile r(v) as profile_curve, so both ends sit on
+// the mug wall, perpendicular to the local wall.
+//
+// Four handle styles:
+//   handle_style 0 = "D" / round
+//                1 = "ear" (tea cup / espresso): small, high, looped
+//                2 = angular: goes straight out, down vertically and back
+//                    (rounded corners)
+//                3 = asymmetric / drop: more reach at the top, high attachment
+//               -1 = picked per mug from the mug's SHAPE: the ear only on low or
+//                    wide mugs (height <= 1.0 rim diameter, or < 8.5 cm), 50 %;
+//                    never on slender mugs. The rest: 50 % D, 25 % angular,
+//                    25 % asymmetric.
+//   handle_thick   tube radius (m); 0 = default for the style.
+//                  -> read by the Sweep: detail("../ASA1", "handle_thickness_used", 0)
+//                     (replace ASA1 with the name of this node)
+//
+// Everything is proportional to the mug:
+//   - handle length = 45-55 % of the mug height (D, angular, asymmetric);
+//     ear 28-42 %; absolute minimum 2.5 cm
+//   - reach out from the wall tied to the mug RADIUS at handle height
+//     (D/angular/asymmetric 0.55-0.95 r, ear 0.35-0.60 r), with a minimum that
+//     fits a finger (2.2 cm; ear 1.4 cm)
+//   - tube radius tied to the mug radius: D/angular/asymmetric 0.105-0.130 r,
+//     ear 0.0735-0.0812 r, clamped to 2.6-8.12 mm
+//
+// Reading the measurements: the node PARAMETER wins (it carries the @glass_*
+// expression of the work item); the geometry attribute is used only if the
+// parameter is 0. asa_h_used / asa_r_base_used / asa_r_top_used record the
+// values actually used.
+//
+// Visual tuning knobs (0 = no change), applied AFTER the rules:
+//   tune_center  shifts the handle centre (fraction of the height, e.g. -0.05)
+//   tune_len     multiplies the handle length      (e.g. 1.1)
+//   tune_out     multiplies the handle reach       (e.g. 0.85)
+//   tune_thick   multiplies the tube thickness     (e.g. 0.8)
+//   tune_style_w multiplies the ear probability    (0.01 = almost never)
+//
+// Note: attribute names starting with asa_ ("asa" = handle) are kept as in
+// the released data.
+// =========================================================================
+
+// parameter first (the @ expression of the work item); if it is 0, the attribute
+float a_h  = isbound("@glass_h")      ? @glass_h      : 0.0;
+float a_rb = isbound("@glass_r_base") ? @glass_r_base : 0.0;
+float a_rt = isbound("@glass_r_top")  ? @glass_r_top  : 0.0;
+float a_bu = isbound("@glass_bulge")  ? @glass_bulge  : 0.0;
+float a_fl = isbound("@glass_flare")  ? @glass_flare  : 0.0;
+float h         = chf("glass_h");       if (h == 0.0)         h = a_h;
+float r_base    = chf("glass_r_base");  if (r_base == 0.0)    r_base = a_rb;
+float r_top     = chf("glass_r_top");   if (r_top == 0.0)     r_top = a_rt;
+float bulge_amp = chf("glass_bulge");   if (bulge_amp == 0.0) bulge_amp = a_bu;
+float flare_exp = chf("glass_flare");   if (flare_exp == 0.0) flare_exp = a_fl;
+
+if (h <= 0.0)         h = 0.12;
+if (r_base <= 0.0)    r_base = 0.030;
+if (r_top <= 0.0)     r_top = 0.040;
+if (flare_exp <= 0.0) flare_exp = 1.0;
+
+function float radiusAt(float v; float r_base; float r_top; float flare_exp; float bulge_amp) {
+    float px = lerp(r_base, r_top, pow(v, flare_exp));
+    px += sin(v * PI) * bulge_amp;
+    return max(px, 0.005);
+}
+
+function vector wallNormal(float v; float h; float r_base; float r_top;
+                           float flare_exp; float bulge_amp; vector dirOut) {
+    float va = max(v - 0.001, 0.0);
+    float vb = min(v + 0.001, 1.0);
+    float drdy = (radiusAt(vb, r_base, r_top, flare_exp, bulge_amp)
+                - radiusAt(va, r_base, r_top, flare_exp, bulge_amp)) / ((vb - va) * h);
+    return normalize(dirOut - set(0, 1, 0) * drdy);
+}
+
+// Chaikin smoothing of an OPEN polyline (keeps the end points)
+function vector[] chaikin(vector pts[]; int iters) {
+    vector cur[] = pts;
+    for (int it = 0; it < iters; it++) {
+        vector nxt[];
+        append(nxt, cur[0]);
+        for (int i = 0; i < len(cur) - 1; i++) {
+            append(nxt, lerp(cur[i], cur[i + 1], 0.25));
+            append(nxt, lerp(cur[i], cur[i + 1], 0.75));
+        }
+        append(nxt, cur[len(cur) - 1]);
+        cur = nxt;
+    }
+    return cur;
+}
+
+// --- handle parameters ---
+float handle_v_top    = chf("handle_v_top");
+float handle_v_bottom = chf("handle_v_bottom");
+float handle_width    = chf("handle_width");
+float handle_angle    = chf("handle_angle");
+float handle_box      = chf("handle_box");
+int   handle_style    = chi("handle_style");
+float handle_thick    = chf("handle_thick");
+// attribute only if the parameter is 0 (and the attribute exists)
+if (handle_v_top    == 0.0 && isbound("@handle_v_top"))    handle_v_top    = @handle_v_top;
+if (handle_v_bottom == 0.0 && isbound("@handle_v_bottom")) handle_v_bottom = @handle_v_bottom;
+if (handle_width    == 0.0 && isbound("@handle_width"))    handle_width    = @handle_width;
+if (handle_box      == 0.0 && isbound("@handle_box"))      handle_box      = @handle_box;
+int   handle_samples  = chi("handle_samples");
+float wall            = chf("wall_thickness");
+
+if (handle_v_top <= 0.0)    handle_v_top = 0.85;
+if (handle_v_bottom <= 0.0) handle_v_bottom = 0.20;
+if (handle_width <= 0.0)    handle_width = 0.035;
+handle_box   = clamp(handle_box, 0.0, 1.0);
+if (handle_samples <= 0)    handle_samples = 24;
+if (wall <= 0.0)            wall = 0.003;
+
+// tuning knobs (0 = no change)
+float t_center = chf("tune_center");
+float t_len    = chf("tune_len");    if (t_len   <= 0.0) t_len   = 1.0;
+float t_out    = chf("tune_out");    if (t_out   <= 0.0) t_out   = 1.0;
+float t_thick  = chf("tune_thick");  if (t_thick <= 0.0) t_thick = 1.0;
+float t_ear    = chf("tune_style_w"); if (t_ear  <= 0.0) t_ear   = 1.0;
+
+// stable per-mug "random" number, derived from parameters the wedge already randomizes
+float hs = frac(handle_box * 7.31 + handle_width * 113.7 + h * 51.3);
+
+// style picked per mug if handle_style = -1
+if (handle_style < 0) {
+    float u_s = frac(hs * 13.7 + r_top * 211.3 + 0.31);
+    // mug proportion: height / rim diameter
+    float slenderness = h / max(0.01, 2.0 * r_top);
+    // ear probability: 50 % on low or wide mugs, never on slender ones
+    float p_ear = (slenderness <= 1.0 || h < 0.085) ? 0.50 : 0.0;
+    p_ear = clamp(p_ear * t_ear, 0.0, 1.0);
+    float p_d     = (1.0 - p_ear) * 0.50;
+    float p_ang   = (1.0 - p_ear) * 0.25;
+    if      (u_s < p_d)                 handle_style = 0;
+    else if (u_s < p_d + p_ear)         handle_style = 1;
+    else if (u_s < p_d + p_ear + p_ang) handle_style = 2;
+    else                                handle_style = 3;
+}
+handle_style = clamp(handle_style, 0, 3);
+
+// --- proportions and per-style adjustments ---
+float center  = 0.51;
+float span_s  = handle_v_top - handle_v_bottom;
+float frac_h  = fit(span_s, 0.30, 0.75, 0.45, 0.55);   // 45-55 % of the height
+float aspect  = fit(handle_width, 0.025, 0.045, 0.40, 0.55);
+float min_len = 0.025;
+if (handle_style == 1) {                  // ear: small and high
+    center  = fit01(hs, 0.55, 0.62);
+    frac_h  = fit(span_s, 0.30, 0.75, 0.28, 0.42);
+    aspect  = fit(handle_width, 0.025, 0.045, 0.55, 0.80);
+    min_len = 0.020;
+    handle_box = handle_box * 0.3;        // round loop
+} else if (handle_style == 3) {           // asymmetric: higher attachment
+    center  = fit01(hs, 0.55, 0.62);
+    frac_h  = fit(span_s, 0.30, 0.75, 0.45, 0.55);      // same as the D
+}
+center += t_center;
+float len_m = clamp(frac_h * h * t_len, min_len, 0.85 * h);
+float half  = 0.5 * len_m / h;
+handle_v_bottom = clamp(center - half, 0.08, 0.80);
+handle_v_top    = clamp(center + half, handle_v_bottom + 0.10, 0.93);
+
+// handle reach tied to the mug RADIUS at handle height
+float r_mid  = radiusAt(center, r_base, r_top, flare_exp, bulge_amp);
+float out_lo = (handle_style == 1) ? 0.35 : 0.55;
+float out_hi = (handle_style == 1) ? 0.60 : 0.95;
+float finger = (handle_style == 1) ? 0.014 : 0.022;      // a finger must fit
+handle_width = max(clamp(len_m * aspect, out_lo * r_mid, out_hi * r_mid) * t_out, finger);
+
+// tube thickness (radius), proportional to the mug radius
+if (handle_thick <= 0.0) {
+    float tk = (handle_style == 1) ? fit01(hs, 0.0735, 0.0812) : fit01(frac(hs * 3.7), 0.105, 0.130);
+    handle_thick = clamp(tk * r_mid * t_thick, 0.002625, 0.00812);
+}
+
+float embed = 0.4 * wall;
+float angleRad = radians(handle_angle);
+vector dirOut = set(cos(angleRad), 0, sin(angleRad));
+vector up = set(0, 1, 0);
+
+vector S0 = dirOut * (radiusAt(handle_v_bottom, r_base, r_top, flare_exp, bulge_amp) + 0.5 * wall) + up * (handle_v_bottom * h);
+vector S3 = dirOut * (radiusAt(handle_v_top,    r_base, r_top, flare_exp, bulge_amp) + 0.5 * wall) + up * (handle_v_top    * h);
+vector n0 = wallNormal(handle_v_bottom, h, r_base, r_top, flare_exp, bulge_amp, dirOut);
+vector n3 = wallNormal(handle_v_top,    h, r_base, r_top, flare_exp, bulge_amp, dirOut);
+vector P0 = S0 - n0 * embed;
+vector P3 = S3 - n3 * embed;
+
+vector path[];
+if (handle_style == 2) {
+    // ---------- angular: P0 -> lower corner -> upper corner -> P3 ----------
+    float w_lo = handle_width * fit01(frac(hs * 5.3), 0.90, 1.00);   // barely trapezoidal
+    float w_hi = handle_width * fit01(frac(hs * 9.1), 1.00, 1.10);
+    vector C0 = S0 + n0 * w_lo;
+    vector C3 = S3 + n3 * w_hi;
+    vector raw[] = array(P0, S0 + n0 * (0.15 * w_lo), C0, C3, S3 + n3 * (0.15 * w_hi), P3);
+    path = chaikin(raw, 3);
+} else {
+    // ---------- Bezier with straight stubs (styles 0, 1, 3) ----------
+    float stub = lerp(0.004, 0.6 * handle_width, handle_box);
+    float k    = max(handle_width - stub, 0.002) / 0.75;
+    float k0 = k, k3 = k;
+    if (handle_style == 3) {              // more reach at the top than at the bottom
+        k0 = k * fit01(frac(hs * 4.1), 0.60, 0.80);
+        k3 = k * fit01(frac(hs * 6.7), 1.15, 1.35);
+    }
+    vector Q0 = S0 + n0 * stub;
+    vector Q3 = S3 + n3 * stub;
+    vector B1 = Q0 + n0 * k0;
+    vector B2 = Q3 + n3 * k3;
+    int nstub = 3;
+    for (int i = 0; i < nstub; i++) append(path, lerp(P0, Q0, float(i) / float(nstub)));
+    for (int i = 0; i <= handle_samples; i++) {
+        float t = float(i) / float(handle_samples);
+        float s = 1.0 - t;
+        append(path, Q0 * (s * s * s) + B1 * (3.0 * s * s * t) + B2 * (3.0 * s * t * t) + Q3 * (t * t * t));
+    }
+    for (int i = 1; i <= nstub; i++) append(path, lerp(Q3, P3, float(i) / float(nstub)));
+}
+
+int prim = addprim(0, "polyline");
+setprimintrinsic(0, "closed", prim, 0);   // open handle path
+foreach (vector p; path) {
+    int pt = addpoint(0, p);
+    addvertex(0, prim, pt);
+}
+
+// --- metrics and checks ---
+float out_max = 0.0;
+foreach (vector p; path) out_max = max(out_max, dot(p - S0, dirOut));
+f@handle_span          = distance(P0, P3);
+f@handle_embed_used    = embed;
+f@handle_box           = handle_box;
+f@handle_wall_tilt_bottom = degrees(acos(clamp(dot(n0, dirOut), -1.0, 1.0)));
+f@handle_wall_tilt_top    = degrees(acos(clamp(dot(n3, dirOut), -1.0, 1.0)));
+f@handle_v_bottom_used = handle_v_bottom;
+f@handle_v_top_used    = handle_v_top;
+f@handle_width_used    = handle_width;
+f@handle_out_max       = out_max;          // actual maximum reach of the handle (m)
+i@handle_style_used    = handle_style;
+f@handle_thickness_used = handle_thick;    // tube radius -> Sweep
+f@handle_out_over_radius = handle_width / r_mid;   // check: reach / radius
+f@asa_h_used           = h;                 // mug measurements the handle was built from
+f@asa_r_base_used      = r_base;
+f@asa_r_top_used       = r_top;
+f@asa_esbeltez         = h / max(0.01, 2.0 * r_top);   // slenderness
+f@asa_center_used      = 0.5 * (handle_v_bottom + handle_v_top);
+f@asa_len_over_h       = handle_v_top - handle_v_bottom;
+s@asa_version          = "v5.11";
