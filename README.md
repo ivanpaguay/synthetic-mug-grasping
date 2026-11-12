@@ -10,9 +10,7 @@ A procedural, physics-checked synthetic data pipeline — Houdini → Isaac Sim 
 | 71 real photos only | SegFormer-B2 | 0.67 | 0.74 |
 | **Synthetic + the same 71 real photos** | SegFormer-B2 | **0.82** | **0.93** |
 
-Synthetic pre-training makes a small real set go much further, and it is stable across seeds (0.815 / 0.816, against a 0.09 spread for real-only). Synthetic data alone does not beat real data yet: the gap concentrates on the handle, and glass fails for every model because the synthetic set has no transparent materials. The full story, including a hypothesis that was tested and rejected, is in the [technical report](#links).
-
-![Pipeline](docs/figures/pipeline.png)
+Synthetic pre-training makes a small real set go much further, and it is stable across seeds (0.815 / 0.816, against a 0.09 spread for real-only). Synthetic data alone does not beat real data yet: the gap concentrates on the handle. Glass fails for every model: transparent objects are rare in the synthetic set (only in the randomized style, about one in ten, with random tint and roughness) and realistic-style mugs are always ceramic. The full story, including a hypothesis that was tested and rejected, is in the [technical report](#links).
 
 ## What the pipeline does
 
@@ -178,7 +176,7 @@ The code and comments are in English. A few string values written into the data 
 
 ## Limitations
 
-One object family, one gripper, one phone and photographer for the real photos; no transparent materials; the handle remains the hardest part for synthetic-only training. See the report for details and next steps.
+One object family, one gripper, one phone and photographer for the real photos; almost no glass in the synthetic set; the handle remains the hardest part for synthetic-only training. See the report for details and next steps.
 
 ## Links
 
