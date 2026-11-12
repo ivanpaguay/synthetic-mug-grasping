@@ -1,0 +1,20 @@
+# data and outputs never go in the repo
+*.exr
+*.bgeo
+*.bgeo.sc
+*.vdb
+*.usd
+*.usdc
+*.pt
+*.pth
+*.npz
+runs/
+renders/
+dataset_*/
+real_photos/
+__pycache__/
+*.pyc
+venv/
+.env
+# third-party gripper geometry (see gripper/README.md)
+gripper/robotiq*/
