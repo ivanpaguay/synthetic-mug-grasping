@@ -2,7 +2,7 @@
 
 A procedural, physics-checked synthetic data pipeline — Houdini → Isaac Sim → Karma — for part-level segmentation of mugs, evaluated on real photos.
 
-**Final test (248 real photos of 61 mugs never seen in training):**
+**Final test (243 real photos of 61 mugs never seen in training; 5 wide-angle photos are reported separately):**
 
 | Training data | Model | mIoU (5 mug parts) | Mug vs background IoU |
 | --- | --- | --- | --- |
@@ -13,6 +13,8 @@ A procedural, physics-checked synthetic data pipeline — Houdini → Isaac Sim 
 Synthetic pre-training makes a small real set go much further, and it is stable across seeds (0.815 / 0.816, against a 0.09 spread for real-only). Synthetic data alone does not beat real data yet: the gap concentrates on the handle. Glass fails for every model: transparent objects are rare in the synthetic set (only in the randomized style, about one in ten, with random tint and roughness) and realistic-style mugs are always ceramic. The full story, including a hypothesis that was tested and rejected, is in the [technical report](#links).
 
 ## What the pipeline does
+
+![Nine stages from a procedural mug to a model tested on real photos](docs/pipeline.png)
 
 1. **Procedural mug family** (Houdini SOPs, VEX). 40 target mugs with part labels — body, handle, rim, interior, base — written into the geometry, plus a physics version (mass, centre of mass) for simulation.
 2. **Grasp generation** (Houdini, KineFX rig of a Robotiq 3F). Candidate grasps filtered by reach, contacts, opposition, collisions along the approach path and force closure.
@@ -68,6 +70,7 @@ Synthetic pre-training makes a small real set go much further, and it is stable 
 | **tools/** | |
 | `overlays.py`, `export_passes.py`, `isaac_clip_candidates.py` | Figures and video material |
 | `export_houdini_code.py` | Exports the VEX and Python from a .hip into this layout |
+| `export_hf_sample.py` | Exports the Hugging Face sample (Parquet, dataset card, preview grid) |
 
 ## Reproducing
 
@@ -180,9 +183,9 @@ One object family, one gripper, one phone and photographer for the real photos; 
 
 ## Links
 
-- Technical report: *link to come*
+- Technical report: [docs/technical_report.pdf](docs/technical_report.pdf)
 - Demo reel: *link to come*
-- Dataset sample (Hugging Face): *link to come*
+- Dataset sample (Hugging Face): [ivanpaguay/synthetic-mug-grasping-sample](https://huggingface.co/datasets/ivanpaguay/synthetic-mug-grasping-sample) — 300 images in pairs without / with the gripper, all passes, CC BY-NC 4.0
 
 ## Licence and credits
 
